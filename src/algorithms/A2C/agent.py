@@ -230,8 +230,7 @@ class A2CAgent:
 
             # plot 1 std deviation as shaded region
             self.fig_assets['reward_patch'] = self.axes[0].fill_between( x, mean - std, mean + std,
-                color='b',  alpha=0.2
-                                                                         )
+                color='b',  alpha=0.2)
 
 
         else:
