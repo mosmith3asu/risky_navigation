@@ -123,6 +123,9 @@ class A2CAgent:
         self.fig = None
         self.axes = None
         self.fig_assets = {}
+        print("A2CAgent initialized.")
+        print(f"State dim: {state_dim}, Action dim: {action_dim}")
+        print(f"Gamma: {gamma}, Learning rate: {lr}, Entropy reg: {entropy_reg}")
 
     def select_action(self, state):
         state_t = torch.FloatTensor(state)
