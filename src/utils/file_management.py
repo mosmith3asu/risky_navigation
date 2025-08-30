@@ -9,6 +9,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
+import glob
 
 import numpy as np
 from numpy import nan
@@ -16,6 +17,10 @@ from numpy import nan
 
 
 # I/O
+
+import os
+def get_project_root():
+    return os.getcwd().split('src')[0]
 
 
 def save_pickle(data, filename):
@@ -28,15 +33,20 @@ def load_pickle(filename):
         return pickle.load(f)
 
 
+def load_latest_pickle(dir_path,base_fname = ''):
+    fpath = dir_path + f"/*{base_fname}.pickle"
+    files = glob.glob(fpath)  # or *.txt, *.json, etc.
+    if not files:
+        raise FileNotFoundError(f"No files found in {fpath}")
+    latest_file = max(files, key=os.path.getmtime)
+    return load_pickle(latest_file), fpath
+
 
 def save_dict_to_file(dic, filename):
     dic = dict(dic)
     with open(fix_filetype(filename, ".txt"), "w") as f:
         f.write(str(dic))
 
-
-def load_dict_from_txt(filename):
-    return load_dict_from_file(fix_filetype(filename, ".txt"))
 
 
 def save_as_json(data, filename):

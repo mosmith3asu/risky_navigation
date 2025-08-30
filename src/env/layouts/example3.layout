@@ -1,0 +1,11 @@
+{
+    "goal":(9.0, 9.0),
+    "start": (1, 1, 90),
+    "obstacles":[
+          {'type': 'rect', 'center': (7, 7.5), 'width': 1.0, 'height': 8},
+          {'type': 'circle', 'center': (7, 3.5), 'radius': 0.5},
+          {'type': 'rect', 'center': (3, 2.5), 'width': 1.0, 'height': 8},
+          {'type': 'circle', 'center': (3, 6.5), 'radius': 0.5}
+    ],
+    "bounds":((0.0, 0.0), (10.0, 10.0)),
+}

@@ -1,5 +1,3 @@
-import copy
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,9 +9,9 @@ from collections import deque
 # Actor network: Gaussian policy
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim,
-                 num_hidden_layers = 3,
+                 num_hidden_layers = 4,
                  size_hidden_layers= 128,
-                 activation='LeakyReLU'
+                 activation='ReLU'
                  ):
         # TODO: scale output to range with tanh func
         super(Actor, self).__init__()
@@ -22,6 +20,9 @@ class Actor(nn.Module):
         self.num_hidden_layers = num_hidden_layers
         self.size_hidden_layers = size_hidden_layers
         self.activation = getattr(nn, activation)
+
+
+
 
         ##########################
         layers = [nn.Linear(state_dim, self.size_hidden_layers), self.activation()]
@@ -57,9 +58,9 @@ class Actor(nn.Module):
 # Critic network: state-value
 class Critic(nn.Module):
     def __init__(self, state_dim,
-                 num_hidden_layers=3,
+                 num_hidden_layers=4,
                  size_hidden_layers=128,
-                 activation='LeakyReLU'):
+                 activation='ReLU'):
         super(Critic, self).__init__()
 
         # self.fc1 = nn.Linear(state_dim, 128)
@@ -88,10 +89,7 @@ class Critic(nn.Module):
         return x
 
 class A2CAgent:
-    def __init__(self, env,
-                 gamma=0.99, lr=5e-4,
-                 entropy_reg=0.000,
-                 grad_clip = 0.75):
+    def __init__(self, env, gamma=0.99, lr=1e-4,entropy_reg=0.001, history_len=10,scale_actions=True):
         """
 
         :param env:
@@ -103,7 +101,6 @@ class A2CAgent:
         self.gamma = gamma
         self.lr = lr
         self.entropy_reg = entropy_reg
-        self.grad_clip = grad_clip
 
         # Initialize actor and critic networks
         state_dim = env.observation_space.shape[0]
@@ -113,10 +110,12 @@ class A2CAgent:
         self.optimizerA = optim.Adam(self.actor.parameters(), lr=0.5*self.lr)
         self.optimizerC = optim.Adam(self.critic.parameters(), lr=self.lr)
 
-        self.reset_params = {'options': {'enable': True,
-                                         'p_rand_state': 0.0,
-                                         'reward_dist2goal': self.env.get_attr('reward_dist2goal')[0]
-                                         }}
+        # history
+        # self.reward_history      = [] #deque(maxlen = history_len)
+        # self.filt_reward_history = np.empty([0, 2])  # deque(maxlen = history_len)
+        self.filt_window         = 100
+        # self.traj_history        = deque(maxlen = history_len)
+        # self.terminal_history    = deque(maxlen = history_len)
 
         self.fig = None
         self.axes = None
@@ -161,18 +160,12 @@ class A2CAgent:
         # critic loss
         critic_loss = F.mse_loss(values, returns)
 
-        self.optimizerA.zero_grad(); actor_loss.backward()
-        self.optimizerC.zero_grad(); critic_loss.backward()
-
-        if self.grad_clip is not None:
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
-
-        self.optimizerA.step()
-        self.optimizerC.step()
+        self.optimizerA.zero_grad(); actor_loss.backward(); self.optimizerA.step()
+        self.optimizerC.zero_grad(); critic_loss.backward(); self.optimizerC.step()
 
     def compute_returns(self, rewards, dones, terminal_return= 0):
         """ computes discounted cumulative returns from ordered trajector of rewards"""
+
 
         returns = np.nan * np.ones_like(rewards)
         R = terminal_return.detach().numpy() \
@@ -315,7 +308,7 @@ class A2CAgent:
 
         # # Trajectories
         if 'traj_lines' not in self.fig_assets.keys():
-            env.reset(**self.reset_params)
+            env.reset()
             if hasattr(env, 'num_envs'):
                 env.call('render', ax=self.axes[1]) # retrieve vec render
             else:
@@ -363,17 +356,16 @@ class A2CAgentVec(A2CAgent):
         self.optimizerA = optim.Adam(self.actor.parameters(), lr=0.5 * self.lr)
         self.optimizerC = optim.Adam(self.critic.parameters(), lr=self.lr)
 
+        self.reset_params = {'options': {'enable': True}}
 
-
-    def train(self, max_episodes=20_000, blocking=True,
-              # rand_start_epi= 500, # 1
-              rand_start_epi=100,  # 1
-              rshape_scale = 1, # 20
-              rshape_epi = 1, #500
+    def train(self, max_episodes=1000, blocking=True,
+              rand_start_epi=5000,
+              rshape_scale = 10,
+              rshape_decay = 0.99,
               report_interval = 5):
 
 
-        reset_params = copy.deepcopy(self.reset_params)
+
         init_reward_dist2goal = self.env.get_attr('reward_dist2goal')[0]
 
 
@@ -391,14 +383,11 @@ class A2CAgentVec(A2CAgent):
         }
 
         for ep in range(1, max_episodes + 1):
+            self.env.set_attr('reward_dist2goal', init_reward_dist2goal + max((rshape_scale - 1) * init_reward_dist2goal, 0))
+            rshape_scale *= rshape_decay  # decay reward shaping scale
 
-            # Schedules
-            _rshape_scale = rshape_scale * (rshape_epi - ep) / rshape_epi if ep < rshape_epi else 1
-            _p_rand_state = (rand_start_epi - ep) / rand_start_epi if ep < rand_start_epi else 0
-            reset_params['options']['p_rand_state'] = _p_rand_state
-            reset_params['options']['reward_dist2goal'] = _rshape_scale*init_reward_dist2goal
 
-            states, _ = self.env.reset(**reset_params)
+            states, _ = self.env.reset(**self.reset_params)
 
             history['ep_len'].append(0)
             history['ep_reward'].append(0.0)
@@ -436,7 +425,7 @@ class A2CAgentVec(A2CAgent):
                 traj_batch['log_probs'] = torch.vstack([traj_batch['log_probs'], logps.unsqueeze(0)])
                 traj_batch['entropies'] = torch.vstack([traj_batch['entropies'], ents.unsqueeze(0)])
 
-                history['ep_len'][-1] +=  np.mean(1-dones)
+                history['ep_len'][-1] += 1
                 history['ep_reward'][-1] += np.mean(rewards)
 
                 history['rew_dist2goal'][-1] += np.mean(infos['rew_dist2goal'])
@@ -475,17 +464,14 @@ class A2CAgentVec(A2CAgent):
                 mean_epilen = np.mean(history['ep_len'])
                 mean_acts = np.mean(np.array(history['action']), axis=0)
                 mean_acts = np.mean(mean_acts, axis=0)
-                print(f"Episode {ep} [len={mean_epilen:.1f}], "
+                print(f"Episode {ep} [len={mean_epilen}], "
                       f"Reward: {mean_epi_reward:.2f} "
                       f"Mean Joy [{mean_acts[0]:.2f} {mean_acts[1]:.2f} ]"
                       f"\t | Shaped Rewards: \t"
                           f"Step: {np.mean(history['rew_step']):.2f} "
                           f"Smooth: {np.mean(history['rew_smooth']):.2f} "
                           f"Dist2goal: {np.mean(history['rew_dist2goal']):.2f} "
-                      f"\t | Params:"
-                      f"P(randS) = {reset_params['options']['p_rand_state']:.2f}"
-                      # f"Dist2goal Rew = {reset_params['options']['reward_dist2goal']:.2f}"
-                      f"Reward Dist2goal: {self.env.get_attr('reward_dist2goal')[0]:.2f}"
+                      # f"Reward Dist2goal: {self.env.get_attr('reward_dist2goal')[0]}"
                       f"")
 
         if blocking:
@@ -497,6 +483,7 @@ class A2CAgentVec(A2CAgent):
         state = self._to_batch(state)
         action, log_prob, entropy = super().select_action(state)
         return action, log_prob.unsqueeze(-1), entropy.unsqueeze(-1)
+
 
     def update(self, traj_batch):
         states      = traj_batch['states']
@@ -510,23 +497,18 @@ class A2CAgentVec(A2CAgent):
         values = self.critic(torch.from_numpy(states)).squeeze()
         returns = self.compute_returns(rewards, dones,terminal_return = values[-1])
         returns = torch.FloatTensor(returns).squeeze(-1)
-
-        # Trim values that are after terminal done state and flatten
-        first_done = np.argmax(dones, axis=0).flatten()
-        values    = torch.concatenate([values[: first_done[i], i] for i in range(self.num_envs)])
-        returns   = torch.concatenate([returns[: first_done[i], i] for i in range(self.num_envs)])
-        log_probs = torch.concatenate([log_probs[: first_done[i], i] for i in range(self.num_envs)])
-        entropies = torch.concatenate([entropies[: first_done[i], i] for i in range(self.num_envs)])
-
         advantages = returns - values.detach()
 
         # actor loss
         actor_loss = (-(log_probs * advantages).mean(0))
         actor_loss += - self.entropy_reg * entropies.mean(0)  # entropy loss encourage exploration
         actor_loss = actor_loss.mean() # mean across all parallel environments
+        # entropy_loss = -self.entropy_reg * entropies.mean()  # encourage exploration
+        # actor_loss = (-(log_probs * advantages).mean(-1)).unsqueeze(-1) + entropy_loss
 
         # critic loss
-        critic_loss = F.mse_loss(values, returns)
+        # critic_loss = F.mse_loss(values.flatten(), returns.flatten()) #TODO: flatten?
+        critic_loss = F.mse_loss(values, returns) #TODO: flatten?
 
         self.optimizerA.zero_grad(); actor_loss.backward(); self.optimizerA.step()
         self.optimizerC.zero_grad(); critic_loss.backward(); self.optimizerC.step()
