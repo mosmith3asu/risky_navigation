@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from collections import deque
 import matplotlib.pyplot as plt
 from datetime import datetime
-from utils.file_management import save_pickle, load_pickle, load_latest_pickle
+from utils.file_management import save_pickle, load_pickle, load_latest_pickle, get_algorithm_dir
 
 # ===== Networks =====
 
@@ -452,7 +452,8 @@ class DDPGAgent:
     def load(self, fpath):
         if fpath.lower() == 'latest':
             fname = self._get_fpath(save_dir = '', with_tstamp=False)
-            load_dict, fpath = load_latest_pickle('./models/',base_fname=fname)
+            models_dir = get_algorithm_dir() + 'models/'
+            load_dict, fpath = load_latest_pickle(models_dir,base_fname=fname)
         else:
             load_dict = load_pickle(fpath)
 
@@ -549,7 +550,8 @@ class DDPGAgentVec(DDPGAgent):
 
         for ep in range(1, max_episodes + 1):
             this_epi_rollouts = 0
-            self.env.set_attr('p_rand_state', max(0, 1 - ep / self.random_start_epis))
+            p_rand_start = max(0, (1 - ep / self.random_start_epis) if self.random_start_epis>0 else 0)
+            self.env.set_attr('p_rand_state',p_rand_start)
 
             # ----------------------------------------------------------------------------
             for _ in range(self.rollouts_per_epi * max_steps):
