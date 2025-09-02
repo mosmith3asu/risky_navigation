@@ -22,6 +22,14 @@ import os
 def get_project_root():
     return os.getcwd().split('src')[0]
 
+def get_algorithm_dir():
+    wdir = os.getcwd()
+    wdir = wdir.replace('\\','/')
+    dir_lst = wdir.split('/')
+    assert 'algorithms' in dir_lst, 'Current working directory is not within the algorithms folder'
+    i_src = dir_lst.index('src')
+    alg_dir = '/'.join(dir_lst[:i_src+3]) + '/'
+    return alg_dir
 
 def save_pickle(data, filename):
     with open(fix_filetype(filename, ".pickle"), "wb") as f:
@@ -34,7 +42,7 @@ def load_pickle(filename):
 
 
 def load_latest_pickle(dir_path,base_fname = ''):
-    fpath = dir_path + f"/*{base_fname}.pickle"
+    fpath = dir_path + f"*{base_fname}.pickle"
     files = glob.glob(fpath)  # or *.txt, *.json, etc.
     if not files:
         raise FileNotFoundError(f"No files found in {fpath}")
