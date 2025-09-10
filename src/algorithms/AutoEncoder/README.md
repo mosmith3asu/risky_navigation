@@ -60,6 +60,23 @@ state   action   goal
   Predicted next_action
 ```
 
+
+---
+
+## Analogy: How the AutoEncoder Works in This Project
+
+Think of the autoencoder as a two-person team working with a book:
+
+- **Original Data (Book):** The agent's current state, previous action, and goal are like the full book.
+- **Encoder (Summarizer):** Reads the book and writes a short summary (the latent vector).
+- **Bottleneck (Summary):** The compressed, essential information about the situation.
+- **Decoder (Rewriter):** Takes the summary and tries to write the next action the agent should take (like rewriting the next page of the book).
+- **Goal:** The predicted next action (rewritten page) should match the real next action (original page) as closely as possible.
+
+In this project, the autoencoder is not reconstructing the original input, but is reconstructing (predicting) the next action that should be taken, given the current situation. It learns the “essence” of how to act in the environment, just like a good summary captures the essence of a book.
+
+---
+
 ## Usage
 - Run `train.py` to train the autoencoder.
 - Run `test.py` to evaluate the trained model.
