@@ -14,6 +14,22 @@ This folder contains implementations of the A2C reinforcement learning algorithm
 - **No replay buffer:** Updates are made using the most recent data.
 - **Parallelism:** Can run multiple environments in parallel for more stable and efficient learning.
 
+
+---
+
+## Analogy: Student and Teacher
+
+Imagine a student (the actor) learning to play a game, and a teacher (the critic) giving feedback after each move:
+
+- **Student (Actor):** Decides what move to make at each step.
+- **Teacher (Critic):** Watches and gives a score for each move, based on how good it is for winning the game.
+- If the move is good, the teacher encourages the student to do it again. If not, the teacher discourages it.
+- Over time, the student learns to make better moves, and the teacher gets better at scoring situations.
+
+In A2C, the actor and critic are neural networks trained together: the actor to maximize rewards, the critic to accurately evaluate states.
+
+---
+
 ## Workflow
 1. The agent observes the current state.
 2. The actor network selects an action.
