@@ -75,6 +75,51 @@ Think of the autoencoder as a two-person team working with a book:
 
 In this project, the autoencoder is not reconstructing the original input, but is reconstructing (predicting) the next action that should be taken, given the current situation. It learns the “essence” of how to act in the environment, just like a good summary captures the essence of a book.
 
+
+## Hyperparameter Tuning for AutoEncoders
+
+Tuning hyperparameters is key to getting good results with autoencoders. Here’s how to do it in this codebase:
+
+### What to Tune
+
+- **Latent Dimension (`latent_dim`)**: Size of the bottleneck. Too small = underfitting, too large = overfitting.
+- **Learning Rate (`lr`)**: How fast the model learns. Too high = unstable, too low = slow.
+- **Batch Size (`batch_size`)**: Number of samples per training step. Larger = smoother, smaller = noisier.
+- **Number of Epochs (`num_epochs`)**: How many times the model sees the dataset. Too few = underfit, too many = overfit.
+- **Network Architecture**: Number of layers/units in encoder/decoder. More = more capacity, but risk of overfitting.
+- **Activation Functions**: E.g., ReLU, LeakyReLU, Tanh.
+
+### Where to Change
+
+- Edit the config section at the top of `src/algorithms/AutoEncoder/train.py`:
+   ```python
+   # --- Config ---
+   num_episodes = 200
+   max_steps = 200
+   latent_dim = 64
+   lr = 1e-3
+   batch_size = 128
+   num_epochs = 20
+   ```
+- Edit the model architecture in `agent.py` if you want to add/remove layers or change units.
+
+### How to Tune
+
+1. Change one parameter at a time and observe the effect on training loss and performance.
+2. Keep a log of what you try and the results.
+3. Use validation data if possible to check for overfitting.
+4. For advanced tuning, consider using libraries like Optuna or Ray Tune.
+
+### Typical Values
+
+| Hyperparameter | Where to Change         | Typical Values         |
+|----------------|------------------------|-----------------------|
+| latent_dim     | `train.py`, `agent.py` | 16, 32, 64, 128       |
+| lr             | `train.py`             | 1e-4, 1e-3, 1e-2      |
+| batch_size     | `train.py`             | 32, 64, 128, 256      |
+| num_epochs     | `train.py`             | 10, 20, 50, 100       |
+| layers/units   | `agent.py`             | 1-3 layers, 32-256 units |
+
 ---
 
 ## Usage
