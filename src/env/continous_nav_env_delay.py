@@ -995,8 +995,6 @@ class ContinuousNavigationEnvVec(ContinuousNavigationEnvBase):
 
         return self.state, self.def_info.copy()
 
-
-
 class DelayedContinuousNavigationEnv(ContinuousNavigationEnvVec):
     def __init__(self, delay_steps=3,  **kwargs):
         super().__init__(**kwargs)
@@ -1017,7 +1015,8 @@ class DelayedContinuousNavigationEnv(ContinuousNavigationEnvVec):
     def robot_state_buffer(self):
         return list(self._robot_state_buffer.copy())
 
-    def get_delayed_state(self):
+
+    def get_delayed_state(self,latest=False):
        # Not a property to indicate that compute is present
        return self.nav_state.update_state(*self.delayed_robot_state).copy()
 
@@ -1106,7 +1105,9 @@ class DelayedContinuousNavigationEnv(ContinuousNavigationEnvVec):
         obs = np.hstack([state, np.array(actions).flatten()])
         return obs
 
-
+    def observe_latest(self):
+        """"Alternative next-state observation that includes latest state (not next delayed)"""
+        raise NotImplementedError("observe_latest not implemented yet")
 
 
 def _make_env_thunk(layout_name, **overrides):
@@ -1284,13 +1285,13 @@ def main_vec():
 
         #
         # # Create prospect theory samples of reward from taking action
-        # reward_vals = possible_rewards[1:] # everything except true env
-        # reward_probs = np.array(env.get_attr('robot_prob'))[1:]
-        # reward_prospect_samples = np.vstack([reward_vals, reward_probs])
+        reward_vals = possible_rewards[1:] # everything except true env
+        reward_probs = np.array(env.get_attr('robot_prob'))[1:]
+        reward_prospect_samples = np.vstack([reward_vals, reward_probs])
         ##################################################################
         ##################################################################
         # Memory template for replay buffer
-        # replay.add(o1, a1, reward_prospect_samples, o2, terminated[0] or truncated[0])
+        replay.add(o1, a1, reward_prospect_samples, o2, terminated[0] or truncated[0])
 
         # Sanity Checks -
         # current_robot_state = env.get_attr('current_robot_state')
