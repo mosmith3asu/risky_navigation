@@ -1,6 +1,6 @@
 # import gym
 import gymnasium as gym
-from gym import spaces
+from gymnasium import spaces
 import numpy as np
 import matplotlib.pyplot as plt
 from src.env.layouts import read_layout_dict

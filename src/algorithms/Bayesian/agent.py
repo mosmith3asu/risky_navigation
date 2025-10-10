@@ -92,7 +92,7 @@ class BayesianDecoder(nn.Module):
         self.fc2.reset_kl()
 
 
-class BayesianActionPredictor:
+class BayesianAgent:
     def __init__(self, state_dim, action_dim, goal_dim, latent_dim=64, lr=1e-3, kl_weight=0.01, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         input_dim = state_dim + action_dim + goal_dim
