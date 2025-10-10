@@ -59,16 +59,3 @@ class AutoEncoderAgent:
 
 	def load(self, path):
 		self.model.load_state_dict(torch.load(path, map_location=self.device))
-
-
-if __name__ == '__main__':
-
-	agent = load_agent('latest')
-	for t in (epi):
-
-
-	    state = env.state
-	    action = agent.act(state)
-		next_state = env.step(action)
-
-		forward_model.train_step(state, action, goal, next_action)
