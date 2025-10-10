@@ -1,6 +1,6 @@
 
 ALGORITHM COMPARISON SUMMARY REPORT
-Generated on: 2025-10-10 16:41:50
+Generated on: 2025-10-10 16:52:06
 ============================================================
 
 EXPERIMENTAL SETUP:
@@ -13,26 +13,27 @@ EXPERIMENTAL SETUP:
 RESULTS RANKING:
 
 1. Best Overall Performance (Average Reward):
-   AutoEncoder - -56.702
+   VAE - -57.042
 
 2. Most Accurate Predictions (Lowest MSE):
-   Transformer - 0.209683
+   Bayesian - 0.208824
 
 3. Highest Success Rate:
-   Bayesian - 0.000
+   VAE - 0.000
 
 4. Fastest Training:
-   Linear - 1.87s
+   Linear - 1.69s
 
 5. Best Validation Performance:
-   Linear - 0.218697
+   AutoEncoder - 0.217552
 
 DETAILED RESULTS:
   algorithm  train_time  test_time  final_train_loss  final_val_loss  avg_mse  avg_reward  success_rate  model_params
-   Bayesian   10.715873  56.557526        543.638742        0.219151 0.217977  -56.780662           0.0         36998
-Transformer   12.887238   2.481410          0.218237        0.219732 0.209683  -57.327852           0.0        563394
-     Linear    1.869990   0.873715          0.218163        0.218697 0.213294  -56.862404           0.0            26
-AutoEncoder    3.244160   1.200162          0.217645        0.220712 0.212211  -56.702106           0.0          9282
+        VAE    5.502809   5.796678          0.218816        0.219149 0.217721  -57.041872           0.0         80450
+AutoEncoder    2.313532   0.943424          0.217246        0.217552 0.214858  -57.428446           0.0          9282
+   Bayesian   11.566823  48.388928        543.705445        0.218596 0.208824  -57.270242           0.0         36998
+Transformer   11.220974   2.123625          0.217986        0.219038 0.221136  -57.180801           0.0        563394
+     Linear    1.690507   0.731506          0.217856        0.219211 0.212831  -57.071752           0.0            26
 
 RECOMMENDATIONS:
 - For real-time applications: Choose the algorithm with fastest training/inference
