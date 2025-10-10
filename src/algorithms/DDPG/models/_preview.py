@@ -32,5 +32,7 @@ if __name__ == '__main__':
     while True:
         time.sleep(0.1)
 
-
+    for t in (epi):
+        state = env.state
+        action = agent.act(state)
 

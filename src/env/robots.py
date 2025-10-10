@@ -10,7 +10,6 @@ class FetchBase(ABC):
                  max_lin_vel=1.0,
                  max_lin_acc=0.5,  # 1.0
                  max_rot_vel=np.pi / 2,  # 3.0
-
                  base_state_validator=None):
 
         self.min_lin_vel = min_lin_vel  # minim linear velocity in m/s (<0 means reversing)
@@ -41,7 +40,11 @@ class FetchBase(ABC):
         self.add_feature('v', bounds=[0, self.max_lin_vel])
         self.add_feature('θ', bounds=[-np.pi, np.pi])
 
-
+    def set_dynamics(self, min_lin_vel, max_lin_vel, max_lin_acc, max_rot_vel):
+        self.min_lin_vel = min_lin_vel
+        self.max_lin_vel = max_lin_vel
+        self.max_lin_acc = max_lin_acc
+        self.max_rot_vel = max_rot_vel
 
     def step(self, Xt, action, dt):
         jx,jy = action  # joystick commands for steering and velocity
@@ -63,8 +66,6 @@ class FetchBase(ABC):
 
         Xtt = Xt + Xdot * dt
         return Xtt
-
-
 
     def post_init(self):
         low_obs = np.array([bound[0] for bound in self._state_bounds.values()], dtype=np.float32)
@@ -108,6 +109,9 @@ class FetchBase(ABC):
 
     def _set(self, name, value):
         self._state[self._state_idxs[name]] = value
+
+    def _set_dynmamic(self, name, value):
+        self.__dict__[name] = value
 
     def add_feature(self, name, bounds = (-np.inf, np.inf), init_val=np.nan):
         self._state_idxs[name] = len(self._state_idxs)
@@ -433,50 +437,84 @@ class Fetch_Lidar(FetchBase):
                     label=f'Dist to lidar{i}')
 
 
-class DelayWrapper:
-    def __init__(self, robot, delay_steps=3):
-        self.robot = robot
-        self.robots = []
+class FetchVec_Wrapper:
+    def __init__(self, robot_base, dynamics_belief, n_robots=5):
+        """
+        Vectorized wrapper for multiple robots with different dynamics sampled from a belief distribution.
+        :param robot_base:
+        :param dynamics_belief: dict of robot dynamics keys with value as (mean, std)
+        :param n_robots:
+        """
+        self._robot_base = robot_base
+        self.n_robots = n_robots
+        self.robots = [self._robot_base.deepcopy() for _ in range(n_robots)]
+        self.dynamics_belief = dynamics_belief
+        self.probs = np.zeros(n_robots) # placeholder for robot probabilities
+
+    def ressample_dynamics(self):
+        """Resamples robot dynamics from belief distribution"""
+        for robot in self.robots:
+            for key, val in self.dynamics_belief.items():
+                mu, std = self.dynamics_belief[key]
+                v = np.random.normal(mu, std)
+                robot._set_dynmamic(key, v)
+                raise NotImplementedError
+                #TODO: need to find joint prob of p(v_i) ∀ v_i
+
+    def steps(self, Xt, at, dt):
+        """Given a single action, compute all next states for each sampled dynamics"""
+        assert Xt.shape[0] == self.n_robots, f"Expected Xt shape[0] to be {self.n_robots}, got {Xt.shape[0]}"
+        possible_states = []
+        for i,robot in enumerate(self.robots):
+            Xtti = robot.step(Xt[i], at, dt)
+            possible_states.append(Xtti)
+        return np.array(possible_states)
+
+    def update_states(self, Xt):
+        """ Add auxillary state features (e.g., lidar) to states"""
+        states = []
+        for i, robot in enumerate(self.robots):
+            states.append(robot.update_state(*Xt[i]))
+
+        return np.array(states)
+
+class DelayedOperator:
+    def __init__(self, robot_base, dynamics_belief, delay_steps=3):
+        """
+        Computes n_robot transitions
+                from    obs = {s_(t-τ), a_(t-τ),..., a_(t-1)}  + a_t
+                to      s_t+1
+        """
+        self._robot_base = robot_base
+        self.robots = FetchVec_Wrapper(robot_base, dynamics_belief)
         self.delay_steps = delay_steps
         self.state_buffer =  deque(maxlen=delay_steps)
         self.action_buffer = deque(maxlen=delay_steps)
 
-
-    def step(self, Xt, at, dt):
-        # self.state_buffer.append(Xt.copy())
-
-        # Apply and Observe delayed state-action
-        a_delayed = self.action_buffer[0]
-
-        # update buffer
-        Xt_new = self.robot.step(self.true_state, a_delayed, dt)
-        self.state_buffer.append(Xt_new.copy())
-        self.action_buffer.append(at.copy())
-
-        return self.observed_state
-
-    def step_belief(self, Xt, at, dt):
-        possible_states = []
-        for robot in self.robots:
-            obs_tt = self.observed_state
-            for tt in range(self.delay_steps):
-                obs_tt = robot.step(obs_tt, at, dt)
-            possible_states.append(obs_tt.copy())
-            # print(f"obs_tt: {obs_tt}")
+    def step(self, delayed_state, at, dt):
+        prev_X = delayed_state
+        for prev_a in self.action_buffer:
+            prev_X = self.robots.steps(prev_X, prev_a, dt)
+        Xtt = self.robots.steps(prev_X, at, dt) # next state after current action applied
 
 
+        return Xtt
 
-        # self.state_buffer.append(Xt.copy())
 
-        # Apply and Observe delayed state-action
-        a_delayed = self.action_buffer[0]
+    def state_belief(self, obs,dt):
+        """calculates samples of the possible current true states given...
+        - delayed state observation obs 
+        - belief about robot dynamics 
+        - past actions since delayed observation
+        """
 
-        # update buffer
-        Xt_new = self.robot.step(self.true_state, a_delayed, dt)
-        self.state_buffer.append(Xt_new.copy())
-        self.action_buffer.append(at.copy())
+        Xt = np.repeat(obs, self.n_robots, axis=0)
+        for at in self.action_buffer:
+            Xt = self.robots.step(Xt, at, dt)
+        return Xt, self.robots.probs
 
-        return self.observed_state
+
+
 
     @property
     def observed_state(self):
@@ -487,6 +525,66 @@ class DelayWrapper:
     def true_state(self):
         """Current Observation"""
         return self.state_buffer[-1]
+
+
+
+#
+# class DelayWrapper:
+#     def __init__(self, robot, delay_steps=3):
+#         self.robot = robot
+#         self.robots = []
+#         self.delay_steps = delay_steps
+#         self.state_buffer =  deque(maxlen=delay_steps)
+#         self.action_buffer = deque(maxlen=delay_steps)
+#
+#
+#     def step(self, Xt, at, dt):
+#         # self.state_buffer.append(Xt.copy())
+#
+#         # Apply and Observe delayed state-action
+#         a_delayed = self.action_buffer[0]
+#
+#         # update buffer
+#         Xt_new = self.robot.step(self.true_state, a_delayed, dt)
+#         self.state_buffer.append(Xt_new.copy())
+#         self.action_buffer.append(at.copy())
+#
+#         return self.observed_state
+#
+#     def step_belief(self, Xt, at, dt):
+#         possible_states = []
+#         for robot in self.robots:
+#             obs_tt = self.observed_state
+#             for tt in range(self.delay_steps):
+#                 obs_tt = robot.step(obs_tt, at, dt)
+#             possible_states.append(obs_tt.copy())
+#             # print(f"obs_tt: {obs_tt}")
+#
+#
+#
+#         # self.state_buffer.append(Xt.copy())
+#
+#         # Apply and Observe delayed state-action
+#         a_delayed = self.action_buffer[0]
+#
+#         # update buffer
+#         Xt_new = self.robot.step(self.true_state, a_delayed, dt)
+#         self.state_buffer.append(Xt_new.copy())
+#         self.action_buffer.append(at.copy())
+#
+#         return self.observed_state
+#
+#     @property
+#     def observed_state(self):
+#         """Delayed Observation"""
+#         return self.state_buffer[0]
+#
+#     @property
+#     def true_state(self):
+#         """Current Observation"""
+#         return self.state_buffer[-1]
+
+
 
 
 
