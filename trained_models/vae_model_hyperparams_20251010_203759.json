@@ -1,0 +1,6 @@
+{
+  "beta": 2.0,
+  "hidden_dim": 256,
+  "latent_dim": 16,
+  "lr": 0.01
+}
