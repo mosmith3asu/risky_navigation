@@ -13,8 +13,12 @@ class AutoEncoder(nn.Module):
         input_dim = state_dim + action_dim + goal_dim
         output_dim = action_dim
         
+        # Ensure hidden_dims represents intermediate layers before the latent bottleneck
         if hidden_dims is None:
-            hidden_dims = [128, latent_dim]
+            hidden_dims = [128]  # Default intermediate layers
+        
+        # Complete encoder architecture: input -> hidden_dims -> latent_dim
+        encoder_dims = hidden_dims + [latent_dim]
         
         # Select activation function
         if activation == 'ReLU':
@@ -31,7 +35,7 @@ class AutoEncoder(nn.Module):
         # Encoder
         encoder_layers = []
         prev_dim = input_dim
-        for hidden_dim in hidden_dims:
+        for hidden_dim in encoder_dims:
             encoder_layers.append(nn.Linear(prev_dim, hidden_dim))
             if batch_norm:
                 encoder_layers.append(nn.BatchNorm1d(hidden_dim))
@@ -44,13 +48,14 @@ class AutoEncoder(nn.Module):
         
         # Decoder
         decoder_layers = []
-        hidden_dims_reversed = list(reversed(hidden_dims[:-1])) + [output_dim]
+        # Decoder architecture: latent_dim -> reversed(hidden_dims) -> output_dim
+        decoder_dims = list(reversed(hidden_dims)) + [output_dim]
         prev_dim = latent_dim
         
-        for i, hidden_dim in enumerate(hidden_dims_reversed):
+        for i, hidden_dim in enumerate(decoder_dims):
             decoder_layers.append(nn.Linear(prev_dim, hidden_dim))
-            if i < len(hidden_dims_reversed) - 1:  # Don't add activation/dropout to output layer
-                if batch_norm and i < len(hidden_dims_reversed) - 2:
+            if i < len(decoder_dims) - 1:  # Don't add activation/dropout to output layer
+                if batch_norm:
                     decoder_layers.append(nn.BatchNorm1d(hidden_dim))
                 decoder_layers.append(self.activation)
                 if dropout > 0:
@@ -106,7 +111,7 @@ class AutoEncoderAgent:
         self.action_dim = action_dim
         self.goal_dim = goal_dim
         self.latent_dim = latent_dim
-        self.hidden_dims = hidden_dims or [128, latent_dim]
+        self.hidden_dims = hidden_dims or [128]  # Default intermediate layers before latent bottleneck
         self.activation = activation
         self.dropout = dropout
         self.batch_norm = batch_norm
@@ -185,7 +190,9 @@ class AutoEncoderAgent:
             # Update architecture if needed
             if 'latent_dim' in param_dict:
                 self.latent_dim = param_dict['latent_dim']
-                self.hidden_dims = [128, self.latent_dim]
+                # Keep hidden_dims as intermediate layers, latent_dim is separate
+            if 'hidden_dims' in param_dict:
+                self.hidden_dims = param_dict['hidden_dims']
             if 'activation' in param_dict:
                 self.activation = param_dict['activation']
             if 'dropout' in param_dict:
