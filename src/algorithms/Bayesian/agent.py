@@ -93,8 +93,18 @@ class BayesianDecoder(nn.Module):
 
 
 class BayesianAgent:
-    def __init__(self, state_dim, action_dim, goal_dim, latent_dim=64, lr=1e-3, kl_weight=0.01, device=None):
+    def __init__(self, state_dim, action_dim, goal_dim, latent_dim=64, lr=1e-3, kl_weight=0.01, 
+                 prior_std=1.0, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Store dimensions for model reconstruction
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.goal_dim = goal_dim
+        self.latent_dim = latent_dim
+        self.lr = lr
+        self.prior_std = prior_std
+        
         input_dim = state_dim + action_dim + goal_dim
         
         # Initialize encoder and decoder
@@ -105,8 +115,7 @@ class BayesianAgent:
         self.kl_weight = kl_weight
         
         # Optimizer
-        params = list(self.encoder.parameters()) + list(self.decoder.parameters())
-        self.optimizer = optim.Adam(params, lr=lr)
+        self._setup_optimizer()
         
         # Number of prediction samples for uncertainty estimation
         self.n_samples = 10
@@ -208,3 +217,297 @@ class BayesianAgent:
         self.encoder.load_state_dict(checkpoint['encoder'])
         self.decoder.load_state_dict(checkpoint['decoder'])
         self.kl_weight = checkpoint['kl_weight']
+    
+    def update_hyperparameters(self, lr=None, kl_weight=None, prior_std=None):
+        """Update hyperparameters and reinitialize optimizer."""
+        if lr is not None:
+            self.lr = lr
+        if kl_weight is not None:
+            self.kl_weight = kl_weight
+        if prior_std is not None:
+            self.prior_std = prior_std
+            # Recreate layers with new prior
+            self._reset_model()
+        
+        self._setup_optimizer()
+    
+    def _setup_optimizer(self):
+        """Setup optimizer."""
+        params = list(self.encoder.parameters()) + list(self.decoder.parameters())
+        self.optimizer = optim.Adam(params, lr=self.lr)
+    
+    def grid_search_hyperparameters(self, train_data, val_data, param_grid, num_epochs=10):
+        """
+        Perform grid search over hyperparameters.
+        
+        Args:
+            train_data: Training data (states, actions, goals, next_actions)
+            val_data: Validation data
+            param_grid: Dictionary of hyperparameters to search
+            num_epochs: Number of epochs to train for each configuration
+            
+        Returns:
+            dict: Best hyperparameters and corresponding validation loss
+        """
+        from itertools import product
+        import copy
+        
+        best_params = None
+        best_val_loss = float('inf')
+        results = []
+        
+        # Generate all combinations of hyperparameters
+        param_names = list(param_grid.keys())
+        param_values = [param_grid[name] for name in param_names]
+        
+        for params in product(*param_values):
+            param_dict = dict(zip(param_names, params))
+            print(f"Testing parameters: {param_dict}")
+            
+            # Reset model with new parameters
+            self._reset_model()
+            
+            # Update parameters
+            if 'latent_dim' in param_dict:
+                self.latent_dim = param_dict['latent_dim']
+                input_dim = self.state_dim + self.action_dim + self.goal_dim
+                self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
+                self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+            
+            # Update other hyperparameters
+            self.update_hyperparameters(**{k: v for k, v in param_dict.items() 
+                                         if k in ['lr', 'kl_weight', 'prior_std']})
+            
+            # Train with current parameters
+            train_losses, val_losses = self._train_epochs(train_data, val_data, num_epochs)
+            final_val_loss = val_losses[-1]
+            
+            results.append({
+                'params': param_dict,
+                'val_loss': final_val_loss,
+                'train_losses': train_losses,
+                'val_losses': val_losses
+            })
+            
+            if final_val_loss < best_val_loss:
+                best_val_loss = final_val_loss
+                best_params = param_dict
+                self.best_state_dict = {
+                    'encoder': copy.deepcopy(self.encoder.state_dict()),
+                    'decoder': copy.deepcopy(self.decoder.state_dict())
+                }
+        
+        # Load best model
+        if hasattr(self, 'best_state_dict'):
+            # Reset with best architecture
+            if 'latent_dim' in best_params:
+                self.latent_dim = best_params['latent_dim']
+                input_dim = self.state_dim + self.action_dim + self.goal_dim
+                self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
+                self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+            
+            self.encoder.load_state_dict(self.best_state_dict['encoder'])
+            self.decoder.load_state_dict(self.best_state_dict['decoder'])
+            self.update_hyperparameters(**{k: v for k, v in best_params.items() 
+                                         if k in ['lr', 'kl_weight', 'prior_std']})
+        
+        return {
+            'best_params': best_params,
+            'best_val_loss': best_val_loss,
+            'all_results': results
+        }
+    
+    def bayesian_optimization_tune(self, train_data, val_data, num_trials=50, num_epochs=10):
+        """
+        Perform Bayesian optimization for hyperparameter tuning using Optuna.
+        
+        Args:
+            train_data: Training data
+            val_data: Validation data
+            num_trials: Number of optimization trials
+            num_epochs: Epochs per trial
+            
+        Returns:
+            dict: Best hyperparameters and optimization history
+        """
+        try:
+            import optuna
+        except ImportError:
+            print("Optuna not installed. Using grid search instead.")
+            # Fallback to grid search
+            param_grid = {
+                'lr': [1e-4, 1e-3, 1e-2],
+                'latent_dim': [32, 64, 128],
+                'kl_weight': [0.001, 0.01, 0.1],
+                'prior_std': [0.1, 1.0, 2.0]
+            }
+            return self.grid_search_hyperparameters(train_data, val_data, param_grid, num_epochs)
+        
+        def objective(trial):
+            # Suggest hyperparameters
+            lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
+            latent_dim = trial.suggest_categorical('latent_dim', [32, 64, 128, 256])
+            kl_weight = trial.suggest_float('kl_weight', 1e-4, 1e-1, log=True)
+            prior_std = trial.suggest_float('prior_std', 0.1, 5.0)
+            
+            # Reset model with new parameters
+            self.latent_dim = latent_dim
+            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            self.encoder = BayesianEncoder(input_dim, latent_dim).to(self.device)
+            self.decoder = BayesianDecoder(latent_dim, self.action_dim).to(self.device)
+            
+            self.update_hyperparameters(lr=lr, kl_weight=kl_weight, prior_std=prior_std)
+            
+            # Train and get validation loss
+            _, val_losses = self._train_epochs(train_data, val_data, num_epochs)
+            
+            return val_losses[-1]
+        
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=num_trials)
+        
+        # Apply best parameters
+        best_params = study.best_params
+        self.latent_dim = best_params['latent_dim']
+        input_dim = self.state_dim + self.action_dim + self.goal_dim
+        self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
+        self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+        
+        self.update_hyperparameters(
+            lr=best_params['lr'],
+            kl_weight=best_params['kl_weight'],
+            prior_std=best_params['prior_std']
+        )
+        
+        return {
+            'best_params': best_params,
+            'best_val_loss': study.best_value,
+            'study': study
+        }
+    
+    def learning_rate_schedule(self, train_data, val_data, scheduler_type='StepLR', 
+                              initial_lr=1e-3, num_epochs=50, **scheduler_kwargs):
+        """
+        Train with learning rate scheduling.
+        
+        Args:
+            train_data: Training data
+            val_data: Validation data  
+            scheduler_type: Type of scheduler ('StepLR', 'ExponentialLR', 'CosineAnnealingLR')
+            initial_lr: Initial learning rate
+            num_epochs: Number of epochs to train
+            **scheduler_kwargs: Additional scheduler parameters
+            
+        Returns:
+            dict: Training history and final metrics
+        """
+        self.lr = initial_lr
+        self._setup_optimizer()
+        
+        # Setup scheduler
+        if scheduler_type == 'StepLR':
+            step_size = scheduler_kwargs.get('step_size', 10)
+            gamma = scheduler_kwargs.get('gamma', 0.1)
+            scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+        elif scheduler_type == 'ExponentialLR':
+            gamma = scheduler_kwargs.get('gamma', 0.95)
+            scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
+        elif scheduler_type == 'CosineAnnealingLR':
+            T_max = scheduler_kwargs.get('T_max', num_epochs)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=T_max)
+        else:
+            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+        
+        train_losses, val_losses = self._train_epochs(train_data, val_data, num_epochs, scheduler)
+        
+        return {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'final_train_loss': train_losses[-1],
+            'final_val_loss': val_losses[-1],
+            'best_val_loss': min(val_losses)
+        }
+    
+    def kl_annealing_schedule(self, train_data, val_data, num_epochs=50, 
+                             annealing_type='linear', max_kl_weight=None):
+        """
+        Train with KL divergence annealing schedule.
+        
+        Args:
+            train_data: Training data
+            val_data: Validation data
+            num_epochs: Number of epochs to train
+            annealing_type: Type of annealing ('linear', 'cosine', 'cyclic')
+            max_kl_weight: Maximum KL weight (default: current kl_weight)
+            
+        Returns:
+            dict: Training history and final metrics
+        """
+        if max_kl_weight is None:
+            max_kl_weight = self.kl_weight
+        
+        train_states, train_actions, train_goals, train_next_actions = train_data
+        val_states, val_actions, val_goals, val_next_actions = val_data
+        
+        train_losses = []
+        val_losses = []
+        kl_weights = []
+        
+        for epoch in range(num_epochs):
+            # Update KL weight based on annealing schedule
+            if annealing_type == 'linear':
+                self.kl_weight = (epoch / num_epochs) * max_kl_weight
+            elif annealing_type == 'cosine':
+                self.kl_weight = max_kl_weight * (1 - np.cos(np.pi * epoch / num_epochs)) / 2
+            elif annealing_type == 'cyclic':
+                cycle_length = num_epochs // 4
+                cycle_pos = epoch % cycle_length
+                self.kl_weight = (cycle_pos / cycle_length) * max_kl_weight
+            
+            kl_weights.append(self.kl_weight)
+            
+            # Training
+            train_loss = self.train_step(train_states, train_actions, train_goals, train_next_actions)
+            train_losses.append(train_loss)
+            
+            # Validation
+            val_loss = self.validate(val_states, val_actions, val_goals, val_next_actions)
+            val_losses.append(val_loss)
+        
+        return {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'kl_weights': kl_weights,
+            'final_train_loss': train_losses[-1],
+            'final_val_loss': val_losses[-1],
+            'best_val_loss': min(val_losses)
+        }
+    
+    def _reset_model(self):
+        """Reset model to initial state."""
+        input_dim = self.state_dim + self.action_dim + self.goal_dim
+        self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
+        self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+    
+    def _train_epochs(self, train_data, val_data, num_epochs, scheduler=None):
+        """Internal method to train for specified epochs."""
+        train_states, train_actions, train_goals, train_next_actions = train_data
+        val_states, val_actions, val_goals, val_next_actions = val_data
+        
+        train_losses = []
+        val_losses = []
+        
+        for epoch in range(num_epochs):
+            # Training
+            train_loss = self.train_step(train_states, train_actions, train_goals, train_next_actions)
+            train_losses.append(train_loss)
+            
+            # Validation
+            val_loss = self.validate(val_states, val_actions, val_goals, val_next_actions)
+            val_losses.append(val_loss)
+            
+            # Step scheduler if provided
+            if scheduler is not None:
+                scheduler.step()
+        
+        return train_losses, val_losses

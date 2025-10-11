@@ -57,7 +57,7 @@ class VAEAgent:
     """
     
     def __init__(self, state_dim, action_dim, goal_dim, latent_dim=64, hidden_dim=128, 
-                 lr=1e-3, beta=1.0, device='cpu'):
+                 lr=1e-3, beta=1.0, weight_decay=0.0, optimizer_type='Adam', device='cpu'):
         """
         Initialize VAE agent.
         
@@ -69,13 +69,19 @@ class VAEAgent:
             hidden_dim: Hidden layer dimension
             lr: Learning rate
             beta: KL divergence weight (beta-VAE parameter)
+            weight_decay: L2 regularization
+            optimizer_type: Type of optimizer
             device: Device to run on
         """
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.goal_dim = goal_dim
         self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.lr = lr
         self.beta = beta
+        self.weight_decay = weight_decay
+        self.optimizer_type = optimizer_type
         self.device = device
         
         # Input is state + current_action + goal, output is next_action
@@ -86,14 +92,13 @@ class VAEAgent:
         self.encoder = VAEEncoder(input_dim, latent_dim, hidden_dim).to(device)
         self.decoder = VAEDecoder(latent_dim, output_dim, hidden_dim).to(device)
         
-        # Optimizer
-        self.optimizer = optim.Adam(
-            list(self.encoder.parameters()) + list(self.decoder.parameters()),
-            lr=lr
-        )
+        # Setup optimizer
+        self._setup_optimizer()
         
         # For tracking training
         self.training_step = 0
+        self.best_val_loss = float('inf')
+        self.best_state_dict = None
         
     def reparameterize(self, mu, logvar):
         """Reparameterization trick for VAE"""
@@ -246,6 +251,328 @@ class VAEAgent:
             mu, logvar = self.encoder(inputs)
             
         return mu.detach().cpu().numpy(), logvar.detach().cpu().numpy()
+    
+    def _setup_optimizer(self):
+        """Setup optimizer based on type."""
+        params = list(self.encoder.parameters()) + list(self.decoder.parameters())
+        if self.optimizer_type == 'Adam':
+            self.optimizer = optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
+        elif self.optimizer_type == 'SGD':
+            self.optimizer = optim.SGD(params, lr=self.lr, weight_decay=self.weight_decay, momentum=0.9)
+        elif self.optimizer_type == 'RMSprop':
+            self.optimizer = optim.RMSprop(params, lr=self.lr, weight_decay=self.weight_decay)
+        else:
+            raise ValueError(f"Unknown optimizer type: {self.optimizer_type}")
+    
+    def update_hyperparameters(self, lr=None, beta=None, weight_decay=None, optimizer_type=None):
+        """Update hyperparameters and reinitialize optimizer."""
+        if lr is not None:
+            self.lr = lr
+        if beta is not None:
+            self.beta = beta
+        if weight_decay is not None:
+            self.weight_decay = weight_decay
+        if optimizer_type is not None:
+            self.optimizer_type = optimizer_type
+        
+        self._setup_optimizer()
+    
+    def grid_search_hyperparameters(self, train_data, val_data, param_grid, num_epochs=10):
+        """
+        Perform grid search over hyperparameters.
+        
+        Args:
+            train_data: Training data (states, actions, goals, next_actions)
+            val_data: Validation data
+            param_grid: Dictionary of hyperparameters to search
+            num_epochs: Number of epochs to train for each configuration
+            
+        Returns:
+            dict: Best hyperparameters and corresponding validation loss
+        """
+        from itertools import product
+        import copy
+        
+        best_params = None
+        best_val_loss = float('inf')
+        results = []
+        
+        # Generate all combinations of hyperparameters
+        param_names = list(param_grid.keys())
+        param_values = [param_grid[name] for name in param_names]
+        
+        for params in product(*param_values):
+            param_dict = dict(zip(param_names, params))
+            print(f"Testing parameters: {param_dict}")
+            
+            # Reset model with new parameters
+            self._reset_model()
+            
+            # Update architecture if needed
+            if 'latent_dim' in param_dict:
+                self.latent_dim = param_dict['latent_dim']
+            if 'hidden_dim' in param_dict:
+                self.hidden_dim = param_dict['hidden_dim']
+            
+            # Recreate model with new architecture
+            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            output_dim = self.action_dim
+            self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
+            self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
+            
+            # Update other hyperparameters
+            self.update_hyperparameters(**{k: v for k, v in param_dict.items() 
+                                         if k in ['lr', 'beta', 'weight_decay', 'optimizer_type']})
+            
+            # Train with current parameters
+            train_losses, val_losses = self._train_epochs(train_data, val_data, num_epochs)
+            final_val_loss = val_losses[-1]
+            
+            results.append({
+                'params': param_dict,
+                'val_loss': final_val_loss,
+                'train_losses': train_losses,
+                'val_losses': val_losses
+            })
+            
+            if final_val_loss < best_val_loss:
+                best_val_loss = final_val_loss
+                best_params = param_dict
+                self.best_state_dict = {
+                    'encoder': copy.deepcopy(self.encoder.state_dict()),
+                    'decoder': copy.deepcopy(self.decoder.state_dict())
+                }
+        
+        # Load best model
+        if self.best_state_dict is not None:
+            # Reset with best architecture
+            if 'latent_dim' in best_params:
+                self.latent_dim = best_params['latent_dim']
+            if 'hidden_dim' in best_params:
+                self.hidden_dim = best_params['hidden_dim']
+            
+            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            output_dim = self.action_dim
+            self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
+            self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
+            
+            self.encoder.load_state_dict(self.best_state_dict['encoder'])
+            self.decoder.load_state_dict(self.best_state_dict['decoder'])
+            self.update_hyperparameters(**{k: v for k, v in best_params.items() 
+                                         if k in ['lr', 'beta', 'weight_decay', 'optimizer_type']})
+        
+        return {
+            'best_params': best_params,
+            'best_val_loss': best_val_loss,
+            'all_results': results
+        }
+    
+    def bayesian_optimization_tune(self, train_data, val_data, num_trials=50, num_epochs=10):
+        """
+        Perform Bayesian optimization for hyperparameter tuning using Optuna.
+        
+        Args:
+            train_data: Training data
+            val_data: Validation data
+            num_trials: Number of optimization trials
+            num_epochs: Epochs per trial
+            
+        Returns:
+            dict: Best hyperparameters and optimization history
+        """
+        try:
+            import optuna
+        except ImportError:
+            print("Optuna not installed. Using grid search instead.")
+            # Fallback to grid search
+            param_grid = {
+                'lr': [1e-4, 1e-3, 1e-2],
+                'latent_dim': [32, 64, 128],
+                'beta': [0.1, 1.0, 4.0],
+                'hidden_dim': [64, 128, 256]
+            }
+            return self.grid_search_hyperparameters(train_data, val_data, param_grid, num_epochs)
+        
+        def objective(trial):
+            # Suggest hyperparameters
+            lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
+            latent_dim = trial.suggest_categorical('latent_dim', [16, 32, 64, 128, 256])
+            hidden_dim = trial.suggest_categorical('hidden_dim', [64, 128, 256, 512])
+            beta = trial.suggest_float('beta', 0.1, 10.0, log=True)
+            weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
+            optimizer_type = trial.suggest_categorical('optimizer_type', ['Adam', 'SGD', 'RMSprop'])
+            
+            # Reset model with new parameters
+            self.latent_dim = latent_dim
+            self.hidden_dim = hidden_dim
+            
+            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            output_dim = self.action_dim
+            self.encoder = VAEEncoder(input_dim, latent_dim, hidden_dim).to(self.device)
+            self.decoder = VAEDecoder(latent_dim, output_dim, hidden_dim).to(self.device)
+            
+            self.update_hyperparameters(lr=lr, beta=beta, weight_decay=weight_decay, 
+                                       optimizer_type=optimizer_type)
+            
+            # Train and get validation loss
+            _, val_losses = self._train_epochs(train_data, val_data, num_epochs)
+            
+            return val_losses[-1]
+        
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=num_trials)
+        
+        # Apply best parameters
+        best_params = study.best_params
+        self.latent_dim = best_params['latent_dim']
+        self.hidden_dim = best_params['hidden_dim']
+        
+        input_dim = self.state_dim + self.action_dim + self.goal_dim
+        output_dim = self.action_dim
+        self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
+        self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
+        
+        self.update_hyperparameters(
+            lr=best_params['lr'],
+            beta=best_params['beta'],
+            weight_decay=best_params['weight_decay'],
+            optimizer_type=best_params['optimizer_type']
+        )
+        
+        return {
+            'best_params': best_params,
+            'best_val_loss': study.best_value,
+            'study': study
+        }
+    
+    def learning_rate_schedule(self, train_data, val_data, scheduler_type='StepLR', 
+                              initial_lr=1e-3, num_epochs=50, **scheduler_kwargs):
+        """
+        Train with learning rate scheduling.
+        
+        Args:
+            train_data: Training data
+            val_data: Validation data  
+            scheduler_type: Type of scheduler ('StepLR', 'ExponentialLR', 'CosineAnnealingLR')
+            initial_lr: Initial learning rate
+            num_epochs: Number of epochs to train
+            **scheduler_kwargs: Additional scheduler parameters
+            
+        Returns:
+            dict: Training history and final metrics
+        """
+        self.lr = initial_lr
+        self._setup_optimizer()
+        
+        # Setup scheduler
+        if scheduler_type == 'StepLR':
+            step_size = scheduler_kwargs.get('step_size', 10)
+            gamma = scheduler_kwargs.get('gamma', 0.1)
+            scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+        elif scheduler_type == 'ExponentialLR':
+            gamma = scheduler_kwargs.get('gamma', 0.95)
+            scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
+        elif scheduler_type == 'CosineAnnealingLR':
+            T_max = scheduler_kwargs.get('T_max', num_epochs)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=T_max)
+        else:
+            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+        
+        train_losses, val_losses = self._train_epochs(train_data, val_data, num_epochs, scheduler)
+        
+        return {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'final_train_loss': train_losses[-1],
+            'final_val_loss': val_losses[-1],
+            'best_val_loss': min(val_losses)
+        }
+    
+    def beta_annealing_schedule(self, train_data, val_data, num_epochs=50, 
+                               annealing_type='linear', max_beta=None):
+        """
+        Train with beta annealing schedule for VAE.
+        
+        Args:
+            train_data: Training data
+            val_data: Validation data
+            num_epochs: Number of epochs to train
+            annealing_type: Type of annealing ('linear', 'cosine', 'cyclic')
+            max_beta: Maximum beta value (default: current beta)
+            
+        Returns:
+            dict: Training history and final metrics
+        """
+        if max_beta is None:
+            max_beta = self.beta
+        
+        train_states, train_actions, train_goals, train_next_actions = train_data
+        val_states, val_actions, val_goals, val_next_actions = val_data
+        
+        train_losses = []
+        val_losses = []
+        beta_values = []
+        
+        for epoch in range(num_epochs):
+            # Update beta based on annealing schedule
+            if annealing_type == 'linear':
+                self.beta = (epoch / num_epochs) * max_beta
+            elif annealing_type == 'cosine':
+                self.beta = max_beta * (1 - np.cos(np.pi * epoch / num_epochs)) / 2
+            elif annealing_type == 'cyclic':
+                cycle_length = num_epochs // 4
+                cycle_pos = epoch % cycle_length
+                self.beta = (cycle_pos / cycle_length) * max_beta
+            
+            beta_values.append(self.beta)
+            
+            # Training
+            train_loss = self.train_step(train_states, train_actions, train_goals, train_next_actions)
+            train_losses.append(train_loss)
+            
+            # Validation
+            val_loss = self.validate(val_states, val_actions, val_goals, val_next_actions)
+            val_losses.append(val_loss)
+        
+        return {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'beta_values': beta_values,
+            'final_train_loss': train_losses[-1],
+            'final_val_loss': val_losses[-1],
+            'best_val_loss': min(val_losses)
+        }
+    
+    def _reset_model(self):
+        """Reset model to initial state."""
+        input_dim = self.state_dim + self.action_dim + self.goal_dim
+        output_dim = self.action_dim
+        self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
+        self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
+        self.training_step = 0
+    
+    def _train_epochs(self, train_data, val_data, num_epochs, scheduler=None):
+        """Internal method to train for specified epochs."""
+        train_states, train_actions, train_goals, train_next_actions = train_data
+        val_states, val_actions, val_goals, val_next_actions = val_data
+        
+        train_losses = []
+        val_losses = []
+        
+        for epoch in range(num_epochs):
+            # Training
+            train_loss = self.train_step(train_states, train_actions, train_goals, train_next_actions)
+            train_losses.append(train_loss)
+            
+            # Validation
+            val_loss = self.validate(val_states, val_actions, val_goals, val_next_actions)
+            val_losses.append(val_loss)
+            
+            # Step scheduler if provided
+            if scheduler is not None:
+                scheduler.step()
+        
+        return train_losses, val_losses
     
     def save(self, path):
         """Save the model"""
