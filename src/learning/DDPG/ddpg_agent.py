@@ -57,12 +57,162 @@ class CriticQ(nn.Module):
 
 # ===== Utilities =====
 
+class OUNoiseBounded:
+    """
+    Ornstein–Uhlenbeck process with bounded state.
+
+    x_{t+dt} = x_t + theta*(mu - x_t)*dt + sigma*sqrt(dt)*N(0, I)
+
+    Parameters
+    ----------
+    shape : tuple or int
+        Shape of the noise state (e.g., action dimension).
+    mu : float or array-like, default 0.0
+        Long-run mean (broadcastable to `shape`).
+    theta : float, default 0.15
+        Mean-reversion rate.
+    sigma : float or array-like, default 0.2
+        Diffusion scale (broadcastable to `shape`).
+    dt : float, default 1e-2
+        Time step.
+    x0 : None or array-like
+        Initial state (bounded). If None, starts at `mu` squashed/trimmed into bounds.
+    low : float or array-like, default -1.0
+        Lower bound(s).
+    high : float or array-like, default 1.0
+        Upper bound(s).
+    mode : {"clip", "reflect", "squash"}, default "reflect"
+        Bounding mode:
+          - "clip": clip state into [low, high]
+          - "reflect": reflect back into [low, high] if overshoot occurs
+          - "squash": evolve latent z (unbounded OU), then x = low + (high-low)*(tanh(z)+1)/2
+    seed : int or None
+        Random seed.
+
+    Notes
+    -----
+    - For "squash" mode, the visible state `x` is always in [low, high] but internally the OU runs on `z`.
+    - For "reflect" mode, large overshoots are handled without bias using modulo reflection.
+
+    Methods
+    -------
+    reset(x0=None): Reset the process state.
+    sample(): Step once and return the new bounded state.
+    __call__(): Alias of `sample()`.
+    state: Property to inspect current bounded state.
+    """
+
+    def __init__(self, shape,
+                 mu=0.0, theta=0.15, sigma=0.2, dt=1e-2,
+                 sigma_min=0.05, sigma_decay=.995,
+
+                 x0=np.array([0,0]),
+                 low=-1.0, high=1.0, mode="reflect",
+                 device = 'cpu',seed=None):
+        self.shape = (shape,) if isinstance(shape, int) else tuple(shape)
+        self.theta = float(theta)
+        self.dt = float(dt)
+        self.mu = np.broadcast_to(np.asarray(mu, dtype=float), self.shape)
+        self.sigma = np.broadcast_to(np.asarray(sigma, dtype=float), self.shape)
+        self.sigma_min = sigma_min
+        self.sigma_decay = sigma_decay
+        self.device = device
+        self.low = np.broadcast_to(np.asarray(low, dtype=float), self.shape)
+        self.high = np.broadcast_to(np.asarray(high, dtype=float), self.shape)
+        if np.any(self.high <= self.low):
+            raise ValueError("All elements of `high` must be greater than `low`.")
+
+        self.mode = str(mode).lower()
+        if self.mode not in {"clip", "reflect", "squash"}:
+            raise ValueError("mode must be 'clip', 'reflect', or 'squash'.")
+
+        self.rng = np.random.default_rng(seed)
+
+        # State variables
+        self._x = None           # visible (bounded) state
+        self._z = None           # latent (for squash mode)
+        self._x0 = x0
+        self.reset()
+
+    # ---------- Public API ----------
+
+    def reset(self):
+        x0 = self._x0
+        """Reset the process. If x0 is None, start from mu (bounded)."""
+        if self.mode == "squash":
+            # initialize latent z so that tanh(z) maps near mu within bounds
+            # invert the squash around midpoint:
+            mid = (self.low + self.high) / 2.0
+            half = (self.high - self.low) / 2.0
+            target = np.clip((self.mu - mid) / np.maximum(half, 1e-12), -0.999999, 0.999999)
+            self._z = np.arctanh(target)
+            self._x = self._squash(self._z) if x0 is None else self._clip_into_bounds(np.asarray(x0, float))
+        else:
+            start = self.mu if x0 is None else np.asarray(x0, dtype=float)
+            self._x = self._clip_into_bounds(start)
+            self._z = None
+
+        dsig = - self.sigma * (1 - self.sigma_decay)
+        sigma = self.sigma + (dsig)
+        self.sigma = np.max([self.sigma_min*np.ones_like(sigma), sigma],axis=0)
+        return self._x.copy()
+
+    def sample(self):
+        """Advance one step and return the new bounded state."""
+        n = self.rng.standard_normal(self.shape)
+        if self.mode == "squash":
+            # OU on latent z, then squash to bounded x
+            self._z = self._z + self.theta * (0.0 - self._z) * self.dt + self.sigma * np.sqrt(self.dt) * n
+            self._x = self._squash(self._z)
+        else:
+            # OU directly on bounded x, then bound via clip or reflect
+            x = self._x + self.theta * (self.mu - self._x) * self.dt + self.sigma * np.sqrt(self.dt) * n
+            if self.mode == "clip":
+                self._x = self._clip_into_bounds(x)
+            elif self.mode == "reflect":
+                self._x = self._reflect_into_bounds(x)
+        return torch.tensor(self._x.copy(), dtype=torch.float32, device=self.device)
+
+    def __call__(self):
+        return self.sample()
+
+    @property
+    def state(self):
+        """Current bounded state (copy)."""
+        return None if self._x is None else self._x.copy()
+
+    # ---------- Utilities ----------
+
+    def _clip_into_bounds(self, x):
+        return np.clip(x, self.low, self.high)
+
+    def _reflect_into_bounds(self, x):
+        """
+        Vectorized reflection into [low, high] handling large overshoots:
+        Maps x using sawtooth reflection with period 2*width.
+        """
+        width = self.high - self.low
+        # Avoid /0 if any widths are zero (already checked above, but guard anyway)
+        width = np.maximum(width, 1e-12)
+        y = (x - self.low) % (2.0 * width)
+        y_ref = np.where(y <= width, self.low + y, self.high - (y - width))
+        return y_ref
+
+    def _squash(self, z):
+        """Map latent z in R smoothly to [low, high] via tanh."""
+        half = (self.high - self.low) / 2.0
+        mid = (self.high + self.low) / 2.0
+        return mid + half * np.tanh(z)
+
+
 class OUNoise:
     """
     Ornstein–Uhlenbeck noise for exploration.
     Handles both single env and vectorized envs by broadcasting on shape.
+    - theta: rate of mean reversion (returns noise to mu)
+    - sigma: scale of noise
     """
-    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.5, dt=1.0, n_envs=1,
+    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.5, n_envs=1,
                  sigma_min = 0.05, sigma_decay=.995, device='cpu'):
 
 
@@ -90,9 +240,35 @@ class OUNoise:
 
     def sample(self):
         x = self.state
-        dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0,1,self.size,device=self.device)
+        # dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0,1,self.size,device=self.device)
+        dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0, 1, self.size, device=self.device)
         self.state = x + dx
         return self.state
+
+    def simulate(self,T=600):
+        n_trials = 3
+        self.reset()
+        # self.theta = 1
+        # self.sigma = 0.05
+        fig,axs = plt.subplots(self.action_dim,n_trials)
+
+        for trial in range(n_trials):
+            data = np.zeros((T, self.action_dim))
+            # xy = np.array([[0.0,0.0]])
+
+            for t in range(T):
+                xy = np.array([[0.0, 0.0]])
+                xy += self.sample().cpu().numpy()
+                data[t,:] = xy
+            # plot data
+            for d in range(self.action_dim):
+                axs[d,trial].plot(data[:,d])
+                axs[d,trial].set_title(f'OU Noise Dimension {["x","y"][d]}')
+                axs[d,trial].hlines(0, xmin=0, xmax=T, colors='k', linestyles='dashed', alpha=0.5)
+                axs[d,trial].set_xlabel('Timestep')
+
+
+        plt.show()
 
 
 
@@ -379,7 +555,8 @@ class DDPGAgent:
                       traj_history, terminal_history,
                       filt_reward_history,
                       env = None,
-                      lw = 0.5):
+                      lw = 0.5,
+                      tpause=0.1):
 
         env = env or self.env
 
@@ -425,7 +602,8 @@ class DDPGAgent:
             if hasattr(env, 'num_envs'):
                 env.call('render', ax=self.axes[1]) # retrieve vec render
             else:
-                env.render(ax=self.axes[1]) # single env render
+
+                env.render(ax=self.axes[1],draw_dist2goal=False, draw_lidar=False) # single env render
 
             self.fig_assets['traj_lines'] = []
             for (traj,term) in zip(traj_history,terminal_history):
@@ -450,7 +628,7 @@ class DDPGAgent:
 
         plt.tight_layout()
         plt.draw()
-        plt.pause(0.001)
+        plt.pause(tpause)
 
 
     def _get_fpath(self, fname=None, suffix= '',
@@ -504,6 +682,7 @@ class DDPGAgentVec(DDPGAgent):
     def __init__(self, envs, **kwargs):
         super().__init__(envs, **kwargs)
 
+
         self.num_envs = self.env.num_envs
         self.single_state_dim = self.env.single_observation_space.shape[0]
         self.single_action_dim = self.env.single_action_space.shape[0]
@@ -527,6 +706,7 @@ class DDPGAgentVec(DDPGAgent):
                           theta=self.ou.theta, sigma=self.ou.sigma,
                           sigma_decay=self.ou.sigma_decay,
                           n_envs=self.num_envs, device=self.device)
+
 
 
     def warmup(self):
@@ -675,8 +855,38 @@ class DDPGAgent_EUT(DDPGAgent):
         self.replay = ProspectReplayBuffer(self.state_dim, self.action_dim,
                                            n_samples=self.env.n_samples,
                                            size=self.replay.size, device=self.device)
+        ou_noise_params = {
+            'shape': self.action_dim,
+            'mu': 0.0,
+            'theta': 0.15,
+            'sigma': 0.5,
+            'sigma_decay': 0.995,
+            'sigma_min': 0.05,
+            'dt': self.env.dt,
+            'low': -1.0,
+            'high': 1.0,
+            'mode': "reflect"
 
-        self.ou.sigma_decay = 0.995
+        }
+        ou_noise_params.update(kwargs.get('ou_noise', {}))
+        self.ou = OUNoiseBounded(**ou_noise_params)
+
+        # self.ou.sigma_decay = 0.995
+        # self.ou.simulate()
+
+        del self.rollouts_per_epi
+        del self.history
+
+        self.log_interval = kwargs.get('log_interval', 10)
+        self.history = {
+            'ep_len': deque(maxlen=self.log_interval),
+            'ep_reward': deque(maxlen=self.log_interval),
+            'action': deque(maxlen=self.log_interval),
+            'xy': deque(maxlen=self.log_interval),
+            'terminal': deque(maxlen=self.log_interval),
+            'timeseries_filt_rewards': np.zeros([0, 2]),
+        }
+
 
 
     def warmup(self):
@@ -686,7 +896,7 @@ class DDPGAgent_EUT(DDPGAgent):
             print(f'\r [{_spin[ep%len(_spin)]}] Running Warmup... [Prog: {int(ep/self.warmup_epis*100)}%]',end='',flush=True)
 
             # RESETS
-            self.env.reset()
+            self.env.reset(p_rand_state = 1 if self.random_start_epis>0 else 0)
 
             i=0
             while i <= self.env.max_steps:
@@ -760,23 +970,19 @@ class DDPGAgent_EUT(DDPGAgent):
             # LOG EPISODE #################################################################
             print(f"[DDPG] Episode {ep} ({i} it; {i * self.env.dt:.1f}sec)"
                   f"| AvgRet: {np.mean(self.history['ep_reward']):.2f} "
-                  f"| AvgLen: {np.mean(self.history['ep_len']):.1f}"
-                  # f"| Steps: {self.total_steps}"
-                  # f"| Rollouts: {self.total_rollouts}"
                   f"| MemLen: {len(self.replay)}"
                   f"| P(rand state):{p_rand_state:.2f}"
-                  f"| OU(sigma): {self.ou.sigma: .3f}"
+                  f"| OU(sigma): {np.mean(self.ou.sigma): .3f}"
                   f"| Terminal: {self.history['terminal'][-1]}"
                   )
 
-            if ep % self.rollouts_per_epi == 0:
+            if ep % self.log_interval == 0:
                 print("")
                 mu, std = np.mean(self.history['ep_reward']), np.std(self.history['ep_reward'])
                 self.history['timeseries_filt_rewards'] = np.vstack((
                     self.history['timeseries_filt_rewards'],
                     np.array([[mu, std]]))
                 )
-
 
                 self._plot_history(traj_history=self.history['xy'],
                                    terminal_history=self.history['terminal'],

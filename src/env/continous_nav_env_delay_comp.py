@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 import math
 import warnings
-from env.mdp import make_belief_fetchrobot_mdp, Compiled_LidarFun, Belief_FetchRobotMDP_Compiled
+from env.mdp import Compiled_LidarFun, Belief_FetchRobotMDP_Compiled
 from utils.file_management import get_project_root
 import os
 
@@ -176,10 +176,10 @@ class Delayed_LidarState:
     ###################################################################################################
     # State/delay handler methods #####################################################################
     def decompose_state(self,S):
-        X = S[0:4]; i =4;
-        ahist = S[i:i+self.action_state_dim];i += self.action_state_dim;
-        goal_dist = S[i:i+self.dist_state_dim];i += self.dist_state_dim;
-        lidar_dists = S[i:i + self.lidar_state_dim];i += self.lidar_state_dim;
+        X = S[0:4]; i =4
+        ahist = S[i:i+self.action_state_dim];i += self.action_state_dim
+        goal_dist = S[i:i+self.dist_state_dim];i += self.dist_state_dim
+        lidar_dists = S[i:i + self.lidar_state_dim];i += self.lidar_state_dim
         return X,ahist,goal_dist,lidar_dists
 
     def compose_state(self,X, ahist, goal_dist, goal_heading, lidar_dists):
@@ -475,7 +475,11 @@ class EnvBase(ABC):
                     color='r', linestyle='--',
                     label=f'Dist to lidar{i}')
 
-    def render_reward_heatmap(self, ax=None, cmap="coolwarm", vmin=None, vmax=None, show_colorbar=True,block=True):
+    def render_reward_heatmap(self, ax=None, cmap="coolwarm",
+                              r_dist2goal=True, r_collision=True, r_goal=True,
+                              vmin=None, vmax=None, show_colorbar=True,
+                              draw_obstacles=False, draw_goal=False, draw_robot=False,
+                              block=True):
 
         # grid = self.vgraph.grid
         # H, W, _ = grid.shape
@@ -486,11 +490,25 @@ class EnvBase(ABC):
         # Compute Z by querying dist at each grid point
         Z = np.empty(resolution, dtype=float)
 
+
+
         for c, x in enumerate(X):
             for r, y in enumerate(Y):
-                dGoal, δGoal = self.nav_state.get_dist2goal_sphere(x, y, 0)  # distances to goal and obstacles
-                rew_dist2goal = self.reward_dist2goal * (1 - (dGoal / self.vgraph.max_dist))  # progress towards goal reward
-                Z[r, c] = float(rew_dist2goal)
+                X = np.array([[x, y, 0.0, 0.0]], dtype=np.float32)
+                dGoal, _ = self.state.f_dist2goal(X)
+                # dGoal, δGoal = self.nav_state.get_dist2goal_sphere(x, y, 0)  # distances to goal and obstacles
+                rew = 0
+                if r_dist2goal:
+                    rew_dist2goal = self.reward_dist2goal * (1 - (dGoal / self.max_dist))  # progress towards goal reward
+                    rew +=  rew_dist2goal
+                if r_collision:
+                    rew_collision = self._check_collision(X) * self.reward_collide
+                    rew = rew_collision
+                if r_goal:
+                    rew_goal = self._check_goal(X) * self.reward_goal
+                    rew += rew_goal
+
+                Z[r, c] = float(rew)
 
         # World-coordinate extent for imshow
         xs = X
@@ -515,15 +533,15 @@ class EnvBase(ABC):
         ax.set_ylabel("y")
         ax.set_title("Visibility-Graph Distance Heatmap")
 
-        self.draw_obstacles(ax)
-        self.draw_goal(ax)
-        self.draw_robot(ax)
+        if draw_obstacles: self.draw_obstacles(ax)
+        if draw_goal: self.draw_goal(ax)
+        if draw_robot: self.draw_robot(ax)
 
-            # Mark goal (if available)
-        if hasattr(self.vgraph, "goal") and self.vgraph.goal is not None:
-            gx, gy = self.vgraph.goal
-            ax.plot(gx, gy, marker="*", markersize=12, linewidth=0, label="goal")
-            ax.legend(loc="upper right")
+        # Mark goal (if available)
+        # if hasattr(self, "goal") and self.goal is not None:
+        #     gx, gy = self.goal
+        #     ax.plot(gx, gy, marker="*", markersize=12, linewidth=0, label="goal")
+        #     ax.legend(loc="upper right")
 
         if show_colorbar:
             cbar = plt.colorbar(im, ax=ax)
@@ -720,6 +738,7 @@ class ContinousNavEnv(EnvBase):
         return self.state.step(action) # State transition
 
     def _resolve_terminal_state(self, states, info):
+        assert states.ndim == 2, f"states should be 2D array, got shape {states.shape}"
         n = states.shape[0]
         dones = np.zeros(n)
 
@@ -742,70 +761,53 @@ class ContinousNavEnv(EnvBase):
         info.update(_info)
         return dones, info
 
-        # if self._check_collision(states):  # Check for collisions
-        #     done = True
-        #     info['reason'] = 'collision'
-        # elif self._check_goal(states):  # Check if goal is reached
-        #     done = True
-        #     info['reason'] = 'goal_reached'
-        # elif self.steps >= self.max_steps:  # Check if max steps reached
-        #     done = True
-        #     info['reason'] = 'max_steps'
-
-        # done = False
-        # if self._check_collision(state):  # Check for collisions
-        #     done = True
-        #     info['reason'] = 'collision'
-        # elif self._check_goal(state):  # Check if goal is reached
-        #     done = True
-        #     info['reason'] = 'goal_reached'
-        # elif self.steps >= self.max_steps:  # Check if max steps reached
-        #     done = True
-        #     info['reason'] = 'max_steps'
-        # return done, info
-
     def _check_collision(self, states):
+        """Checks if the robot has collided with any obstacles"""
+        assert states.ndim == 2, f"states should be 2D array, got shape {states.shape}"
         n = states.shape[0]
         xy = np.array([states[:,self.state.ix], states[:,self.state.iy]], dtype=np.float32)
         dones = np.zeros(n)
 
         for obs in self.obstacles:
             if obs['type'] == 'circle':
-                is_inside = np.linalg.norm(xy - obs['center'], axis=0) <= obs['radius'] + self.car_radius
-                assert is_inside.shape == dones.shape
+                is_inside = np.linalg.norm(xy - obs['center'].reshape(2,1), axis=0) <= obs['radius'] + self.car_radius
+                assert is_inside.shape == dones.shape, f"{is_inside.shape} vs {dones.shape}"
                 dones += is_inside
-
-                # if np.linalg.norm(xy - obs['center']) <= obs['radius'] + self.car_radius:
-                #     done = True
-                #     return done
             else:
                 cx, cy = obs['center']
                 w, h = obs['width'], obs['height']
                 x, y = xy
                 is_inside = (cx - w / 2 <= x) & (x <= cx + w / 2) & (cy - h / 2 <= y) & (y <= cy + h / 2)
-                assert is_inside.shape == dones.shape
+                assert is_inside.shape == dones.shape,  f"{is_inside.shape} vs {dones.shape}"
                 dones += is_inside
 
-                # if (cx - w / 2 <= x <= cx + w / 2) and (cy - h / 2 <= y <= cy + h / 2):
-                #     done = True
-                #     return done
-
-        # done = False
         dones = np.clip(dones, 0, 1)
         return dones
-        # return dones[0] if n == 1 else dones
 
 
     def _check_goal(self, states):
-        dones = np.zeros(states.shape[0])
-        xy = np.array([states[:, self.state.ix], states[:, self.state.iy]], dtype=np.float32)
-        v = states[:, self.state.iv]
+        """Checks if the robot has reached the goal"""
+        assert states.ndim == 2, f"states should be 2D array, got shape {states.shape}"
+        n_samples = states.shape[0]
+        dones = np.zeros(n_samples)
 
-        dist_to_goal = np.linalg.norm(xy - np.array(self.goal)[:,np.newaxis],axis=0)
-        is_inside = (dist_to_goal <= self.goal_radius) + (v < self.goal_velocity) == 2 # and condition
-        assert is_inside.shape == dones.shape
-        dones += is_inside
+        # Get relevant vars and reshape
+        goal_rad = np.array([self.goal_radius]).reshape(1,1)
+        goal_v = np.array([self.goal_velocity]).reshape(1,1)
+        goal_xy = np.array(self.goal, dtype=np.float32).reshape(1,2)
 
+        # xy = np.hstack([states[:, self.state.ix], states[:, self.state.iy]], dtype=np.float32).reshape(n_samples,2)
+        xy = states[:, :2]
+        v = states[:, self.state.iv].reshape(n_samples,1)
+
+        # Perform checks
+        dist_to_goal = np.linalg.norm(xy - goal_xy, axis=1).reshape(n_samples,1)
+        is_inside = np.array(dist_to_goal <= goal_rad, dtype=int)
+        is_stopped = np.array(v <= goal_v,dtype=int)
+        assert is_inside.shape == is_stopped.shape
+
+        # Combine checks and return
+        dones += (is_inside + is_stopped == 2).flatten()
         dones = np.clip(dones, 0, 1)
         return dones
 
@@ -859,10 +861,17 @@ def main_vec():
     # plt.show(block=True)
 
     fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    env.render_reward_heatmap(ax=axs[0], r_collision=False, r_dist2goal=True ,r_goal=False,draw_obstacles=True,show_colorbar=True, block=False)
+    env.render_reward_heatmap(ax=axs[1], r_collision=False, r_dist2goal=True ,r_goal=True,draw_obstacles=True,show_colorbar=True, block=False)
+    env.render_reward_heatmap(ax=axs[2], r_collision=True, r_dist2goal=True ,r_goal=True,draw_obstacles=False,show_colorbar=True, block=True)
+
+
     joystick = VirtualJoystick(ax=axs[0], deadzone=0.05, smoothing=0.35, spring=True)
     axs[-1].set_title("Virtual Joystick Input")
 
     env.reset()
+
+
     total_reward = 0.0
     rewards = []
     done = False

@@ -1,30 +1,46 @@
 import sys
-
+import os
+import pickle
 import numpy as np
 from shapely.geometry import Point, LineString, Polygon
 import networkx as nx
 import math
+import hashlib
+import json
 
 class VisibilityGraph:
     """A class to build a visibility graph for the continuous navigation environment."""
 
-    def __init__(self, goal, obstacles, bounds, resolution=(20, 20),is_compiled=True):
+    def __init__(self, goal, obstacles, bounds, resolution=(20, 20),cached=True):
         if resolution[0]*resolution[1] < 20*20:
             print(f"Warning: visibility graph resolution {resolution} may be low; "
                   f"consider increasing to at least 400 elements (e.g., 20x20) for better accuracy." ,file=sys.stderr)
 
-        print('Precomuting visibility graph...', end=' ')
+        print('Precomuting visibility graph...')
         self.goal = tuple(goal)
         self.obstacles = [self.create_poly(obstacle) for obstacle in obstacles]
-        self.grid = self.create_grid(bounds, resolution)
-        self.graph = self.build_graph(self.grid)
-        self.dist_grid,self.norm_grid = self.precompute_distances(self.grid, self.graph)
+        self.bounds = bounds
+        self.resolution = resolution
+        self.cached = cached
 
-        self.invalid_mask = np.where(self.norm_grid == np.inf, True,False)
-        self.invalid_offset = 1e6*self.invalid_mask
-        print('\t finished.')
 
-        self.max_dist = np.max(self.norm_grid[~self.invalid_mask])  # max distance to goal in valid grid points
+        if self.cached and self.is_cached():
+            self.load_cache()
+        else:
+            print('\t| Recomputing...')
+            print('\t| Creating grid...')
+            self.grid = self.create_grid(bounds, resolution)
+            print('\t| Building graph...')
+            self.graph = self.build_graph(self.grid)
+            print('\t| Computing distances grid...')
+            self.dist_grid,self.norm_grid = self.precompute_distances(self.grid, self.graph)
+            self.invalid_mask = np.where(self.norm_grid == np.inf, True,False)
+            self.invalid_offset = 1e6*self.invalid_mask
+            self.max_dist = np.max(self.norm_grid[~self.invalid_mask])  # max distance to goal in valid grid points
+            if self.cached:
+                print('\t| saving to cache...')
+                self.save_cache()
+        print('\t| finished.')
 
     def closest_idx(self, x, y):
         if self.is_compiled:
@@ -81,13 +97,11 @@ class VisibilityGraph:
         theta = np.arctan2(dy, dx) - theta
         return np.array([r, theta], dtype=np.float32)
 
-
     def get_compiled_funs(self):
         f = Compiled_Dist2GoalFun(self.grid, self.norm_grid, self.dist_grid)
         return f.dist_dtheta
 
         # return Compiled_Dist2GoalFun(self.grid, self.norm_grid, self.dist_grid)
-
 
     # ----------------- helpers & builders -----------------
 
@@ -252,6 +266,59 @@ class VisibilityGraph:
             return path
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None
+
+    # ----------------- saves/cache methods -----------------
+    def load_cache(self):
+        fname = self.get_fname()
+        fdir = self.get_fdir()
+        fpath = os.path.join(fdir, fname)
+        with open(fpath, 'rb') as f:
+            cached_obj = pickle.load(f)
+            self.grid = cached_obj.grid
+            self.graph = cached_obj.graph
+            self.dist_grid = cached_obj.dist_grid
+            self.norm_grid = cached_obj.norm_grid
+            self.invalid_mask = cached_obj.invalid_mask
+            self.invalid_offset = cached_obj.invalid_offset
+            self.max_dist = cached_obj.max_dist
+            print('\t| loaded from cache.')
+
+    def save_cache(self):
+        # save this object to a pickle file
+        fname = self.get_fname()
+        fdir = self.get_fdir()
+        fpath = os.path.join(fdir, fname)
+        with open(fpath, 'wb') as f:
+            pickle.dump(self, f)
+
+    def is_cached(self):
+        fname = self.get_fname()
+        fdir = self.get_fdir()
+        fpath = os.path.join(fdir, fname)
+        return os.path.exists(fpath)
+
+    def get_fdir(self):
+        utils_dir = os.path.dirname(os.path.abspath(__file__))
+        filepath = os.path.join(utils_dir, 'visibility_graph_cache')
+        if not os.path.exists(filepath):
+            os.makedirs(filepath)
+        return filepath
+
+    def get_fname(self):
+        hash_dict = {
+            'goal': str(self.goal),
+            'obstacles': str(self.obstacles),
+            'bounds': str(self.bounds),
+            'resolution': str(self.resolution)
+        }
+        hash_str = json.dumps(hash_dict, sort_keys=True,separators=(',', ':')).encode('utf-8')
+        return 'vgraph_' + str(hashlib.sha256(hash_str).hexdigest()) + '.pkl'
+        # return f"vgraph_cache_{hash(frozenset(hash_dict.items()))}.pkl"
+        # hash_str = str(hash_dict)
+        # invalid_fname_chars = ['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>', '.', ' ', '(', ')', ',', '[', ']', '{', '}', ':',"'",'"']
+        # for char in invalid_fname_chars:
+        #     hash_str = hash_str.replace(char, '')
+        # return hash_str + '.pkl'
 
 
 from numba import types, njit

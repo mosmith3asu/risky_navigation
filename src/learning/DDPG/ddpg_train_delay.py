@@ -16,6 +16,7 @@ if __name__ == '__main__':
         # 'b_max_rot_vel': (np.pi / 4, 1e-6)
     }
     env_config['n_samples'] = 50
+    env_config['vgraph_resolution'] = 30
 
 
     agent_config = {
@@ -25,11 +26,20 @@ if __name__ == '__main__':
         'tau': 0.005,
         # 'buffer_size': 100_000,
         'buffer_size': 50_000,
+        # 'buffer_size': 20_000,
         'batch_size': 256,
         'grad_clip': 0.75,
 
         'warmup_epis': 20,
-        'random_start_epis': 20,
+        'random_start_epis': 50,
+
+        'ou_noise': {
+                'theta': 0.15,
+                'sigma': 0.3,
+                'sigma_decay': 0.995,
+                'sigma_min': 0.05,
+                'mode': "reflect"
+        }
 
     }
 
