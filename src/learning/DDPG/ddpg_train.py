@@ -1,5 +1,5 @@
-from src.algorithms.DDPG.ddpg_agent import DDPGAgentRationalProspects
-from src.env.continous_nav_env_delay import build_sync_vector_env, DelayedContinuousNavigationEnv
+from learning.DDPG.ddpg_agent import DDPGAgent,DDPGAgentVec
+from src.env.continous_nav_env import build_sync_vector_env, ContinuousNavigationEnvBase
 from src.env.layouts import read_layout_dict
 
 if __name__ == '__main__':
@@ -7,13 +7,11 @@ if __name__ == '__main__':
     PARALLEL_ENVS = 5
     LAYOUT = 'example2'
 
+
+
+
     layout_dict = read_layout_dict(LAYOUT)
-    base_env = DelayedContinuousNavigationEnv(vgraph_resolution=(10, 10),**layout_dict)
-    sampled_env = build_sync_vector_env(
-        n_envs=PARALLEL_ENVS,
-        layout_name=LAYOUT,
-        vgraph = base_env.vgraph
-    )
+    env = ContinuousNavigationEnvBase(vgraph_resolution=(20, 20),**layout_dict)
 
     agent_config = {
         'actor_lr': 1e-4,
@@ -28,7 +26,16 @@ if __name__ == '__main__':
         'warmup_epis': 10,
         'random_start_epis': 30,
     }
-    agent = DDPGAgentRationalProspects(base_env, sampled_env, **agent_config)
+
+    if VECTORIZE:
+        vec_env = build_sync_vector_env(
+            n_envs=PARALLEL_ENVS,
+            layout_name=LAYOUT,
+            vgraph = env.vgraph
+        )
+        agent = DDPGAgentVec(vec_env, **agent_config)
+    else:
+        agent = DDPGAgent(env,**agent_config) #TODO: Base class needs updating
 
 
     agent.train(max_episodes=300)

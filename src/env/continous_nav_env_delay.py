@@ -23,18 +23,123 @@ from collections import deque
 import copy
 
 
+#################################################################################
+# MDP and State Classes #########################################################
+#################################################################################
+class FetchRobotMDP:
+    def __init__(self,
+                 min_lin_vel = 0.0, #min_lin_vel = -0.5,
+                 max_lin_vel = 1.0,
+                 max_lin_acc = 0.5, # 1.0
+                 max_rot_vel = np.pi/2, #3.0
+                 dynamics_belief = None
+                 ):
+
+        # Robot dynamics parameters
+        self.min_lin_vel = min_lin_vel  # minim linear velocity in m/s (<0 means reversing)
+        self.max_lin_vel = max_lin_vel  # maximum linear velocity in m/s
+        self.max_lin_acc = max_lin_acc
+        self.max_rot_vel = max_rot_vel
+
+        self._dynamics_belief = dynamics_belief
+        self._robot_prob = None
+
+    def step(self, Xt, action, dt):
+        jx, jy = action  # joystick commands for steering and velocity
+        _, _, v, θ = Xt.T
+
+        vel_ref = -1 * self.min_lin_vel if jy < 0 else self.max_lin_vel
+
+        vdot = jy * vel_ref - v
+        vdot = np.sign(vdot) * min(abs(vdot), self.max_lin_acc)
+        θdot = jx * self.max_rot_vel
+
+        θ += θdot * dt
+        v += vdot * dt
+
+        # Dynamics equations
+        xdot = v * np.cos(θ)
+        ydot = v * np.sin(θ)
+
+
+
+        # Update state
+        Xdot = np.array([xdot, ydot, vdot, θdot])
+        assert Xdot.shape == Xt.shape, f"Xdot shape {Xdot.shape} does not match Xt shape {Xt.shape}"
+
+        Xtt = Xt + Xdot * dt
+        return Xtt
+        # jx,jy = action  # joystick commands for steering and velocity
+        # _, _, v, θ = Xt.T
+        #
+        # # Dynamics equations
+        # xdot = v * np.cos(θ)
+        # ydot = v * np.sin(θ)
+        #
+        # vel_ref = -1*self.min_lin_vel if jy<0 else self.max_lin_vel
+        #
+        # vdot = jy * vel_ref - v
+        # vdot = np.sign(vdot) * min(abs(vdot), self.max_lin_acc)
+        # θdot = jx * self.max_rot_vel
+        #
+        # # Update state
+        # Xdot = np.array([xdot, ydot, vdot, θdot])
+        # assert Xdot.shape == Xt.shape, f"Xdot shape {Xdot.shape} does not match Xt shape {Xt.shape}"
+        #
+        # Xtt = Xt + Xdot * dt
+        # return Xtt
+
+    def resample_dynamics(self):
+        assert self.dynamics_belief is not None, "dynamics_belief needs to be set in FetchRobotMDP"
+        p_dynamics = 1
+        for key, val in self.dynamics_belief.items():
+            mu, std = self.dynamics_belief[key]
+            v = np.random.normal(mu, std)
+            self.__dict__[key] = v
+            p_sample = norm.pdf(v, loc=mu, scale=std)
+            p_dynamics *= p_sample
+        self._robot_prob = p_dynamics
+
+    @property
+    def robot_prob(self):
+        return self._robot_prob
+
+    @property
+    def dynamics_belief(self):
+        return self._dynamics_belief
+
+    @dynamics_belief.setter
+    def dynamics_belief(self, value):
+        if value is not None:
+            assert isinstance(value, dict), "dynamics_belief must be a dictionary of parameter:(mu,std) pairs"
+            for key, val in value.items():
+                assert hasattr(self, key), f"dynamics_belief key {key} not an attribute of the robot"
+                assert isinstance(val, (list, tuple)) and len(
+                    val) == 2, f"dynamics_belief value for {key} must be (mu,std)"
+                mu, std = val
+                assert isinstance(mu, (int, float)) and isinstance(std, (
+                int, float)) and std >= 0, f"dynamics_belief value for {key} must be (mu,std) with std>=0"
+        self._dynamics_belief = value
+
+
+
 class StateBase(ABC):
-    def __init__(self, start_pos, start_velocity, start_heading, parent_env,
-                 base_state_validator=None):
+    def __init__(self,
+                 # start_pos, start_velocity, start_heading, parent_env,
+                 # base_state_validator=None
+                 start_pos, start_velocity, start_heading,
+                 goal, bounds, vgraph, obstacles, robot,
+                 base_state_validator=None
+        ):
         self.start_pos = tuple(start_pos)
         self.start_velocity = start_velocity
         self.start_heading = start_heading
 
-        self.goal = parent_env.goal
-        self.bounds = parent_env.bounds
-        self.vgraph = parent_env.vgraph
-        self.obstacles = parent_env.obstacles
-        self.robot = parent_env.robot
+        self.goal = goal
+        self.bounds = bounds
+        self.vgraph = vgraph
+        self.obstacles = obstacles
+        self.robot = robot
 
         self.base_state_validator = base_state_validator # function to validate base state during randomization
 
@@ -53,6 +158,10 @@ class StateBase(ABC):
         low_obs = np.array([bound[0] for bound in self._state_bounds.values()], dtype=np.float32)
         high_obs = np.array([bound[1] for bound in self._state_bounds.values()], dtype=np.float32)
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
+
+    def step(self, *args, **kwargs):
+       return self.robot.step(*args, **kwargs)  # Update robot state based on action
+
 
     @abstractmethod
     def reset(self,*args, **kwargs):
@@ -159,7 +268,9 @@ class StateBase(ABC):
     def base_state(self):
         return self._state[0:4].copy()
     def deepcopy(self):
-        new_instance = self.__class__(self.start_pos, self.start_velocity, self.start_heading, None)
+        new_instance = self.__class__(self.start_pos, self.start_velocity, self.start_heading,
+                                      self.goal, self.bounds, self.vgraph, self.obstacles, self.robot
+                                      )
 
         new_instance._state_bounds = self._state_bounds.copy()
         new_instance._state_names = self._state_names.copy()
@@ -178,8 +289,8 @@ class State_DistanceHeading(StateBase):
         - dObst: distance to closest obstacle
         - δObst: relative heading to closest obstacle
     """
-    def __init__(self, start_pos,start_velocity,start_heading, parent_env, **kwargs):
-        super().__init__(start_pos, start_velocity, start_heading, parent_env, **kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.add_feature('dGoal', bounds = [0     , np.inf]) # distance to goal
         self.add_feature('δGoal', bounds = [-np.pi, np.pi] ) # relative heading to the goal
         self.add_feature('dObst', bounds = [0     , np.inf]) # spherical distance to the closest obstacle,
@@ -285,9 +396,8 @@ class State_DistanceHeading(StateBase):
                 color='r', linestyle='--', label='Dist to Goal')
 
 class State_Lidar(StateBase):
-    def __init__(self, start_pos, start_velocity, start_heading, parent_env, **kwargs):
-        super().__init__(start_pos, start_velocity, start_heading, parent_env, **kwargs)
-
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.n_rays = kwargs.get('n_rays', 16)
         self.add_feature('dGoal', bounds=[0, np.inf])  # distance to goal
         self.add_feature('δGoal', bounds=[-np.pi, np.pi])  # relative heading to the goal
@@ -415,7 +525,218 @@ class State_Lidar(StateBase):
                     color='r', linestyle='--',
                     label=f'Dist to lidar{i}')
 
+class DelayedStateWrapper:
+    def __init__(self, standard_state,delay_steps,dt,**kwargs):
+        self._nav_state = standard_state
+        self.robot = self._nav_state.robot
+        self.delay_steps = delay_steps
+        self.dt = dt
+
+
+        low_obs = np.array([bound[0] for bound in self._nav_state._state_bounds.values()], dtype=np.float32)
+        high_obs = np.array([bound[1] for bound in self._nav_state._state_bounds.values()], dtype=np.float32)
+        low_obs = np.hstack([low_obs, np.full(2*delay_steps, -1, dtype=np.float32)]) # 2*delay_steps for ax,ay history
+        high_obs = np.hstack([high_obs, np.full(2*delay_steps, 1, dtype=np.float32)])
+        self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
+
+
+        self._computed_delayed_state = None # var to avoid recomputation aux features of unchanged states (clear on buffer mod)
+        self._computed_current_robot_state = None # var to avoid recomputation aux features of unchanged states (clear on buffer mod)
+        self._computed_current_state = None  # var to avoid recomputation aux features of unchanged states (clear on buffer mod)
+
+        # expected_size = self._nav_state.size + 2*delay_steps # state size + 2*delay_steps for ax,ay history
+
+        # Add action history to state feature
+        # for i in range(delay_steps):
+        #     self._nav_state.add_feature(f'ax{i}', bounds=[-1, 1], init_val=np.nan)
+        #     self._nav_state.add_feature(f'ay{i}', bounds=[-1, 1], init_val=np.nan)
+        # self._nav_state.post_init()
+
+        # assert self._nav_state.size == expected_size, f"State size {self._nav_state.size} " \
+        #                                                    f"does not match expected size {expected_size} " \
+        #                                                    f"after adding action history features."
+
+        # Create buffers
+        self._action_buffer = deque(maxlen=delay_steps)
+        self._robot_state_buffer = deque(maxlen=delay_steps)
+
+        # Uninitialized variables
+        self.dynamics_belief = kwargs.get('dynamics_belief', None)
+        self.robot_prob = None
+
+
+    #-----------------------------------------------------------------
+    # Buffer management
+    #-----------------------------------------------------------------
+    def put_delay_buffers(self,current_robot_state,action):
+        self._action_buffer.append(action)
+        self._robot_state_buffer.append(current_robot_state)
+        self._clear_computed_states()
+
+    def _clear_computed_states(self):
+        self._computed_delayed_state = None
+        self._computed_current_state = None
+        self._computed_current_robot_state = None
+
+    def reset(self,resample=True, *args,**kwargs):
+        """ Reset the state and clear buffers."""
+        self.clear_buffer()
+        if resample: self.resample_robot()
+        state = self._nav_state.reset(*args,**kwargs)
+        self.fill_buffer(robot_state = state[:4])
+        self._clear_computed_states()
+        return self.observation
+
+    def clear_buffer(self):
+        """ Clear the delay buffers."""
+        self._action_buffer.clear()
+        self._robot_state_buffer.clear()
+        self._clear_computed_states()
+
+    def fill_buffer(self, action=(0.0, 0.0), robot_state=None):
+        """ Fill the delay buffers with uniform values (e.g., waiting at beginning). """
+        if robot_state is None:
+            robot_state = self._nav_state.base_state
+        action = np.array(action, dtype=np.float32)
+        while not self.is_full:
+            self.put_delay_buffers(robot_state, action)
+        self._clear_computed_states()
+
+    def resample_robot(self):
+        """ Resample robot dynamics parameters from belief distribution and update robot_prob."""
+        assert self.dynamics_belief is not None, "dynamics_belief needs to be set before sampling"
+        p_dynamics = 1
+        for key, val in self.dynamics_belief.items():
+            mu, std = self.dynamics_belief[key]
+            v = np.random.normal(mu, std)
+            self.robot.__dict__[key] = v
+            p_sample = norm.pdf(v, loc=mu, scale=std)
+            p_dynamics *= p_sample
+        self.robot_prob = p_dynamics
+        self._clear_computed_states()
+
+    @property
+    def action_buffer(self):
+        return list(self._action_buffer.copy())
+
+    @property
+    def robot_state_buffer(self):
+        return list(self._robot_state_buffer.copy())
+
+    #-----------------------------------------------------------------
+    # State Getters
+    #-----------------------------------------------------------------
+    @property
+    def delayed_robot_state(self):
+        return self.robot_state_buffer[0]
+
+    @property
+    def current_robot_state(self):
+        return self.robot_state_buffer[-1]
+
+    def get_delayed_state(self):
+        if self._computed_delayed_state is not None:
+            return self._computed_delayed_state
+
+        delayed_state = self._nav_state.update_state(*self.delayed_robot_state,hold_prev=True).copy()
+        actions = np.array(self.action_buffer).flatten()
+        delayed_state[-len(actions):] = actions
+        self._computed_delayed_state = delayed_state
+        return delayed_state
+
+
+    def infer_curr_robot_state_history(self):
+        """Calculates what current state is from delayed obs, prev actions, and dynamics model."""
+
+        curr_robot_state = self.delayed_robot_state
+        hist = [curr_robot_state]
+        for prev_a in self.action_buffer:
+            hist.append(self.robot.step(hist[-1], prev_a, self.dt))  # Update robot state based on actiom
+        return hist
+
+    # def curr_robot_state_belief(self):
+    def infer_curr_robot_state(self):
+        """Calculates what current state is from delayed obs, prev actions, and dynamics model."""
+        if self._computed_current_robot_state is not None:
+            return self._computed_current_robot_state
+
+        curr_robot_state = self.delayed_robot_state
+        for prev_a in self.action_buffer:
+            curr_robot_state = self.robot.step(curr_robot_state, prev_a, self.dt)  # Update robot state based on action
+        self._computed_current_robot_state = curr_robot_state
+        return curr_robot_state
+
+    def infer_curr_state(self):
+
+        """Calculates what current state is from delayed obs, prev actions, and dynamics model + aux features"""
+        if self._computed_current_state is not None:
+            return self._computed_current_state
+
+        curr_robot_state = self.infer_curr_robot_state()
+        # state = self.update_state(*curr_robot_state).copy()
+        curr_state = self._nav_state.update_state(*curr_robot_state, hold_prev=True).copy()
+        self._computed_current_state = curr_state
+        return curr_state
+
+    # def observe(self):
+    @property
+    def observation(self):
+        state = self.get_delayed_state()
+        actions = np.array(self.action_buffer).flatten()
+        obs = np.hstack([state, np.array(actions).flatten()])
+        assert self.is_valid_observation(obs), f"Observation {obs} is not valid."
+        return obs
+        # return self.get_delayed_state()
+
+    # -----------------------------------------------------------------
+    # Inherit standard state attributes/methods
+    # -----------------------------------------------------------------
+
+    # def get_base_startstate(self,*args, **kwargs):
+    #     return self._nav_state.get_base_startstate(*args, **kwargs)
+    #
+    # def step(self,*args, **kwargs):
+    #     return self._nav_state.step(*args, **kwargs)
+    # #
+    # def update_state(self, *args, **kwargs):
+    #     return self._nav_state.update_state(*args, **kwargs)
+
+
+    # @property
+    # def observation_space(self):
+    #     return self._nav_state.observation_space
+
+    #-----------------------------------------------------------------
+    # Status properties
+    #-----------------------------------------------------------------
+    @property
+    def is_consistant_size(self):
+        return len(self._action_buffer) == len(self._robot_state_buffer)
+
+    @property
+    def is_full(self):
+        return len(self._action_buffer) == self._action_buffer.maxlen and len(
+            self._robot_state_buffer) == self._robot_state_buffer.maxlen
+
+    @property
+    def is_empty(self):
+        return len(self._action_buffer) == 0 or len(self._robot_state_buffer) == 0
+
+    @property
+    def is_sampled(self):
+        return self.dynamics_belief is not None and self.robot_prob is not None
+
+    def is_valid_observation(self,obs):
+        assert len(obs) == self.observation_space.shape[0], f"Observation size {len(obs)} does not match observation_space size {self.observation_space.shape[0]}"
+        assert not np.any(np.isnan(obs)), "Obs contains NaN values after reset. Likley missed definition in subclass."
+        return True
+
+
+#################################################################################
+# Environment Classes ###########################################################
+#################################################################################
 class ContinuousNavigationEnvBase(gym.Env):
+
     def __init__(self,
                  goal           = (5.0 , 5.0),
                  bounds         = ((0.0, 0.0) , (10.0, 10.0)),
@@ -448,34 +769,21 @@ class ContinuousNavigationEnvBase(gym.Env):
         # MDP parameters ------------------------------------------------------------------------------------------
         self.dt               = dt
         self.max_steps        = max_steps
-        # self.reward_goal      = kwargs.get('reward_goal'   , 10.0)
-        # self.reward_collide   = kwargs.get('reward_collide', -20.0)           # penalty for collision
-        # self.reward_step      = kwargs.get('reward_step'   , -10/max_steps)   # penalty for being slow
-        # self.reward_dist2goal = kwargs.get('reward_dist'   , 0.25)#20/max_steps)    # maximum possible reward being close to goal
-        # self.reward_smooth    = kwargs.get('reward_smooth' , 5/max_steps)     # maximum possible reward for smooth trajectory
-
         self.reward_goal      = kwargs.get('reward_goal'   , 10.0   )
         self.reward_collide   = kwargs.get('reward_collide', -20.0  )  # penalty for collision
         self.reward_step      = kwargs.get('reward_step'   , -0.1   )  # penalty for being slow
         self.reward_dist2goal = kwargs.get('reward_dist'   , 0.1    )  # 20/max_steps)    # maximum possible reward being close to goal
         self.reward_smooth    = kwargs.get('reward_smooth' , 0   )  # maximum possible reward for smooth trajectory
 
-        # self.reward_goal      = kwargs.get('reward_goal'   , 0)
-        # self.reward_collide   = kwargs.get('reward_collide', 0)  # penalty for collision
-        # self.reward_step      = kwargs.get('reward_step'   , 0)  # penalty for being slow
-        # self.reward_dist2goal = kwargs.get('reward_dist'   , 0)  # 20/max_steps)    # maximum possible reward being close to goal
-        # self.reward_smooth    = kwargs.get('reward_smooth' , 0)  # maximum possible reward for smooth trajectory
 
         assert self.reward_dist2goal <= -1*self.reward_step, 'Reward for distance to goal should be less than or equal to timecost' \
                                                    ' to make completing task faster aslways more optimal. '
 
         if vgraph is None:
-            resolution = kwargs.get('vgraph_resolution', (20, 20))  # resolution for visibility graph
+            # resolution = kwargs.get('vgraph_resolution', (20, 20))  # resolution for visibility graph
+            resolution = kwargs.get('vgraph_resolution', (10, 10))  # resolution for visibility graph
             self.vgraph = VisibilityGraph(self.goal, self.obstacles, self.bounds, resolution=resolution)
         else: self.vgraph = vgraph
-
-        robot_dynamics = kwargs.get('robot_dynamics', {})
-        self.robot = FetchRobotMDP(**robot_dynamics)  # initialize robot dynamics
 
         # Action parameters ------------------------------------------------------------------------------------------
         self.action_bounds = {}
@@ -488,8 +796,14 @@ class ContinuousNavigationEnvBase(gym.Env):
 
         self.steps = 0
         self.done = False  # flag to indicate if the episode is done
-        # self.nav_state = State_DistanceHeading(start_pos, start_velocity, start_heading, self, base_state_validator=self.check_collision)
-        self.nav_state = State_Lidar(start_pos, start_velocity, start_heading, self,base_state_validator=self.check_collision)
+
+        # self.nav_state = State_Lidar(start_pos, start_velocity, start_heading, self, base_state_validator=self.check_collision)
+
+        robot_dynamics = kwargs.get('robot_dynamics', {})
+        robot = FetchRobotMDP(**robot_dynamics, dynamics_belief=kwargs.get('dynamics_belief',None))  # initialize robot dynamics
+        self.nav_state = State_Lidar(start_pos, start_velocity, start_heading,
+                                     self.goal, self.bounds, self.vgraph, self.obstacles, robot,
+                                     base_state_validator=self.check_collision)
 
     def reset(self,*args,**kwargs):
         self.steps = 0
@@ -498,7 +812,6 @@ class ContinuousNavigationEnvBase(gym.Env):
         is_random_state = kwargs.get('p_rand_state', 0) > np.random.rand()
         state = self.nav_state.reset(random_start=is_random_state)
         return state, {}
-
 
     def step(self, action):
         assert not self.done, "Environment is done. Please reset it before stepping."
@@ -510,6 +823,7 @@ class ContinuousNavigationEnvBase(gym.Env):
         new_state       = self.resolve_action(self.robot_state, action)  # Update state based on action and robot dynamics
         self.done, info = self.resolve_terminal_state(new_state, info)
         reward, info    = self.resolve_rewards(prev_state, new_state, info)
+
 
         # self.state = new_state # set new state
 
@@ -555,13 +869,16 @@ class ContinuousNavigationEnvBase(gym.Env):
 
         if self.done and "collision" in info['reason']:
             reward += self.reward_collide
+            print(f'Collision occurred at step {self.steps}.')
         elif self.done and "goal_reached" in info['reason']:
             reward += self.reward_goal
+            print(f'Goal reached at step {self.steps}!')
 
         return reward, info
 
     def resolve_action(self,robot_state, action):
-        x, y, v, θ = self.robot.step(robot_state, action, self.dt)  # Update robot state based on action
+        x, y, v, θ = self.nav_state.step(robot_state, action, self.dt)  # Update robot state based on action
+        # x, y, v, θ = self.robot.step(robot_state, action, self.dt)  # Update robot state based on action
         new_state = self.nav_state.update_state(x, y, v, θ)  # Update the navigation state
         return new_state
 
@@ -853,6 +1170,27 @@ class ContinuousNavigationEnvBase(gym.Env):
         return self.nav_state.base_state
 
 class ContinuousNavigationEnvVec(ContinuousNavigationEnvBase):
+
+    @staticmethod
+    def _make_generator(cls, layout_name, **overrides):
+        def _generator():
+            layout = read_layout_dict(layout_name)
+            layout.update(overrides)
+            env = cls(**layout)
+            return env
+        return _generator
+
+    @classmethod
+    def build_sync_vector_env(cls, n_envs, layout_name, **overrides):
+        """
+        Create a SyncVectorEnv of N identical ContinuousNavigationEnv instances.
+        Use vec_env.reset(seed=...) to seed all subenvs; use reset_done(mask) to
+        selectively reset finished envs.
+        """
+        generators = [cls._make_generator(cls, layout_name, **overrides) for _ in range(n_envs)]
+        return SyncVectorEnv(generators)
+
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.terminal_reward = 0
@@ -983,73 +1321,30 @@ class ContinuousNavigationEnvVec(ContinuousNavigationEnvBase):
             state, _ = super().reset(p_rand_state=p_rand_state)
             return state, self.def_info.copy()
 
-        # elif options is not None:
-        #
-        #     self.reward_dist2goal = options.get('reward_dist2goal', self.reward_dist2goal)
-        #
-        #     enable = options.get('enable', True) if options is not None else False
-        #     if enable:
-        #         self.terminal_reward = 0
-        #         self.terminal_reason = ''
-        #         return super().reset(p_rand_state=options.get('p_rand_state', 0))
-
         return self.state, self.def_info.copy()
 
 class DelayedContinuousNavigationEnv(ContinuousNavigationEnvVec):
-    def __init__(self, delay_steps=3,  **kwargs):
+
+    def __init__(self, delay_steps=3,**kwargs):
         super().__init__(**kwargs)
+        # self.nav_state = DelayedStateWrapper(self.nav_state.deepcopy(),delay_steps,self.dt,**kwargs)
+        self.delayed_state = DelayedStateWrapper(self.nav_state.deepcopy(), delay_steps, self.dt, **kwargs)
+
+
+        # setattr(self.__class__, f"nav_state", property(self._nav_state_override)) # override nav_state attribute in parent classes with delay wrapper
         self.delay_steps = delay_steps
-        self.dynamics_belief = None
-        self.robot_prob = None
 
-        self.enable_resample = True
-
-        self._action_buffer = deque(maxlen=delay_steps)
-        self._robot_state_buffer = deque(maxlen=delay_steps)
-        self.is_true_env = False
 
     @property
-    def action_buffer(self):
-        return list(self._action_buffer.copy())
+    def observation_space(self):
+        return self.delayed_state.observation_space
     @property
-    def robot_state_buffer(self):
-        return list(self._robot_state_buffer.copy())
-
-
-    def get_delayed_state(self,latest=False):
-       # Not a property to indicate that compute is present
-       return self.nav_state.update_state(*self.delayed_robot_state).copy()
+    def state(self):
+        return self.delayed_state.observation
 
     @property
-    def delayed_robot_state(self):
-        return self.robot_state_buffer[0]
-
-    @property
-    def current_robot_state(self):
-        return self.robot_state_buffer[-1]
-
-    def update_delay_buffers(self,current_robot_state,action):
-        self._action_buffer.append(action)
-        self._robot_state_buffer.append(current_robot_state)
-
-
-    def curr_robot_state_belief_history(self):
-        """Tracks history when: Calculates what current state is from delayed obs, prev actions, and dynamics model."""
-        hist = []
-        curr_robot_state = self.delayed_robot_state
-        # self.robot.update_state(curr_robot_state)
-        hist.append(curr_robot_state)
-        for prev_a in self.action_buffer:
-            curr_robot_state = self.robot.step(curr_robot_state, prev_a, self.dt)  # Update robot state based on action
-            hist.append(curr_robot_state)
-        return np.array(hist)
-
-    def curr_robot_state_belief(self):
-        """Calculates what current state is from delayed obs, prev actions, and dynamics model."""
-        curr_robot_state = self.delayed_robot_state
-        for prev_a in self.action_buffer:
-            curr_robot_state = self.robot.step(curr_robot_state, prev_a, self.dt)  # Update robot state based on action
-        return curr_robot_state
+    def robot_prob(self):
+        return self.delayed_state.robot_prob
 
     def step(self, action):
         """Gymnasium-style step: returns (obs, reward, terminated, truncated, info). """
@@ -1064,14 +1359,11 @@ class DelayedContinuousNavigationEnv(ContinuousNavigationEnvVec):
             return self.state, float(self.terminal_reward), \
                 bool(terminated), bool(truncated), info
 
-
         # get current state (belief | dynamics) based on delayed state observation + prev actions since then
-        curr_robot_state = self.curr_robot_state_belief()
-
+        prev_state = self.delayed_state.infer_curr_state()
 
         # Resolve what you think is current state transition
-        prev_state = self.nav_state.update_state(*curr_robot_state).copy()
-        new_state = self.resolve_action(curr_robot_state, action)
+        new_state = self.resolve_action(prev_state[:4], action)
         self.done, reason = self.resolve_terminal_state(new_state, info)
 
         info['reason'] = reason
@@ -1083,150 +1375,65 @@ class DelayedContinuousNavigationEnv(ContinuousNavigationEnvVec):
         # terminated, truncated, info = self.resolve_terminal_state(new_state, info)
         reward, info = self.resolve_rewards(prev_state, new_state, info, terminated, truncated)
 
-        return new_state, float(reward), bool(terminated), bool(truncated), info
+        # return new_state, float(reward), bool(terminated), bool(truncated), info
+        return self.delayed_state.observation, float(reward), bool(terminated), bool(truncated), info
 
     def resample_robot(self):
-        if self.is_true_env: # dont resample ground truth env
-            return
+        self.delayed_state.resample_robot()
 
-        assert self.dynamics_belief is not None, "dynamics_belief needs to be set with env.set_attr('belief_dynamics', belief_dynamics)"
-        p_dynamics = 1
-        for key, val in self.dynamics_belief.items():
-            mu, std = self.dynamics_belief[key]
-            v = np.random.normal(mu, std)
-            self.robot.__dict__[key] = v
-            p_sample = norm.pdf(v, loc=mu, scale=std)
-            p_dynamics *= p_sample
-        self.robot_prob = p_dynamics
+    def reset(self, seed=None, options=None):
+        """  Reset the environment and return the initial observation. """
+        enable_reset = self.enable_reset
+        if options is not None:
+            enable_reset = options.get('enable', enable_reset)
+            self.reward_dist2goal = options.get('reward_dist2goal', self.reward_dist2goal)
+
+
+        if self.auto_reset or enable_reset:
+            state, info = super().reset(seed=seed, options=options)
+            self.delayed_state.reset()
+
+        return self.state, self.def_info.copy()
+
+
+
+        # p_rand_state = self.p_rand_state
+        # enable_reset = self.enable_reset
+        # if options is not None:
+        #     enable_reset = options.get('enable', enable_reset)
+        #
+        #     # # sample random state here instead
+        #     # p_rand_state = options.get('p_rand_state', p_rand_state)
+        #     # p_rand_state = np.random.rand() < p_rand_state
+        #     # options['p_rand_state'] = p_rand_state  # ensure passed to super().reset
+        #
+        # state, _ = super().reset(seed=seed,options=options)
+        #
+        # # Reset buffers/fill
+        # if self.auto_reset or enable_reset:
+        #
+        #     self._action_buffer.clear()
+        #     self._robot_state_buffer.clear()
+        #     for _ in range(self.delay_steps):
+        #         self._action_buffer.append(np.array([0,0], dtype=np.float32))
+        #         self._robot_state_buffer.append(self.robot_state)
+        #
+        # return self.state, self.def_info.copy()
 
     def observe(self):
-        state = self.get_delayed_state()
-        actions = np.array(self.action_buffer).flatten()
-        obs = np.hstack([state, np.array(actions).flatten()])
-        return obs
+        return self.delayed_state.observation
 
-    def observe_latest(self):
-        """"Alternative next-state observation that includes latest state (not next delayed)"""
-        raise NotImplementedError("observe_latest not implemented yet")
+    def infer_curr_robot_state_history(self):
+        return self.delayed_state.infer_curr_robot_state_history()
 
-
-def _make_env_thunk(layout_name, **overrides):
-    """Returns a thunk that builds a single ContinuousNavigationEnv."""
-
-    def _thunk():
-        layout = read_layout_dict(layout_name)
-        layout.update(overrides)
-        env = DelayedContinuousNavigationEnv(**layout)
-        return env
-
-    return _thunk
-
-def build_sync_vector_env(n_envs=4, layout_name='example1', **overrides):
-    """
-    Create a SyncVectorEnv of N identical ContinuousNavigationEnv instances.
-    Use vec_env.reset(seed=...) to seed all subenvs; use reset_done(mask) to
-    selectively reset finished envs.
-    """
-    thunks = [_make_env_thunk(layout_name, **overrides) for _ in range(n_envs)]
-    return SyncVectorEnv(thunks)
-
-
-class FetchRobotMDP:
-    def __init__(self,
-                 min_lin_vel = 0.0, #min_lin_vel = -0.5,
-                 max_lin_vel = 1.0,
-                 max_lin_acc = 0.5, # 1.0
-                 max_rot_vel = np.pi/2 #3.0
-                 ):
-
-        # Robot dynamics parameters
-        self.min_lin_vel = min_lin_vel  # minim linear velocity in m/s (<0 means reversing)
-        self.max_lin_vel = max_lin_vel  # maximum linear velocity in m/s
-        self.max_lin_acc = max_lin_acc
-        self.max_rot_vel = max_rot_vel
-
-
-
-    def step(self, Xt, action, dt):
-        jx, jy = action  # joystick commands for steering and velocity
-        _, _, v, θ = Xt.T
-
-        vel_ref = -1 * self.min_lin_vel if jy < 0 else self.max_lin_vel
-
-        vdot = jy * vel_ref - v
-        vdot = np.sign(vdot) * min(abs(vdot), self.max_lin_acc)
-        θdot = jx * self.max_rot_vel
-
-        θ += θdot * dt
-        v += vdot * dt
-
-        # Dynamics equations
-        xdot = v * np.cos(θ)
-        ydot = v * np.sin(θ)
-
-
-
-        # Update state
-        Xdot = np.array([xdot, ydot, vdot, θdot])
-        assert Xdot.shape == Xt.shape, f"Xdot shape {Xdot.shape} does not match Xt shape {Xt.shape}"
-
-        Xtt = Xt + Xdot * dt
-        return Xtt
-        # jx,jy = action  # joystick commands for steering and velocity
-        # _, _, v, θ = Xt.T
-        #
-        # # Dynamics equations
-        # xdot = v * np.cos(θ)
-        # ydot = v * np.sin(θ)
-        #
-        # vel_ref = -1*self.min_lin_vel if jy<0 else self.max_lin_vel
-        #
-        # vdot = jy * vel_ref - v
-        # vdot = np.sign(vdot) * min(abs(vdot), self.max_lin_acc)
-        # θdot = jx * self.max_rot_vel
-        #
-        # # Update state
-        # Xdot = np.array([xdot, ydot, vdot, θdot])
-        # assert Xdot.shape == Xt.shape, f"Xdot shape {Xdot.shape} does not match Xt shape {Xt.shape}"
-        #
-        # Xtt = Xt + Xdot * dt
-        # return Xtt
-
-
-def check_uniform_buffers(env):
-    action_bufs = np.array(env.get_attr('action_buffer'))
-    state_bufs = np.array(env.get_attr('robot_state_buffer'))
-
-    for i in range(np.shape(action_bufs)[0]):
-        assert np.all(action_bufs[0] == action_bufs[i]), f"Action buffers are not uniform: {action_bufs}"
-        assert np.all(state_bufs[0] == state_bufs[i]), f"State buffers are not uniform: {state_bufs}"
-
-def check_consistant_current_state(base_env, env):
-    true_state = base_env.state[0:4]
-    states = env.get_attr('current_robot_state')
-    for i, s in enumerate(states):
-        assert np.all(true_state == s), f"Current robot states do not match! {true_state} vs {s} in env {i}"
-
-
+    def put_delay_buffers(self, current_robot_state, action):
+        self.delayed_state.put_delay_buffers(current_robot_state, action)
 
 
 def main_vec():
-    PARALLEL_ENVS = 15
+    PARALLEL_ENVS = 5
     LAYOUT = 'example2'
     layout_dict = read_layout_dict(LAYOUT)
-
-    base_env = ContinuousNavigationEnvBase(vgraph_resolution=(10, 10),**layout_dict)
-    env =  build_sync_vector_env(
-        n_envs=PARALLEL_ENVS,
-        layout_name=LAYOUT,
-        vgraph=base_env.vgraph
-    )
-
-    base_env.reset()
-    env.set_attr('enable_reset', True)
-    states, _ = env.reset()
-    env.set_attr('enable_reset', False)
-
     # Set dynamics belief for all envs
     dynamics_belief = {
         # 'min_lin_vel': (0.0, 0.1),
@@ -1235,55 +1442,63 @@ def main_vec():
         # 'max_rot_vel': (np.pi/2, 0.1)
 
         'max_lin_vel': (1.0, 0.5),
-        'max_lin_acc': (0.5, 0.5),
-        'max_rot_vel': (np.pi / 2, 0.5*np.pi)
+        'max_lin_acc': (0.5, 0.2),
+        'max_rot_vel': (np.pi / 2, 0.5 * np.pi)
 
         # 'max_lin_vel': (1.0, 4),
         # 'max_lin_acc': (0.5, 4),
         # 'max_rot_vel': (np.pi / 2, 4 * np.pi)
     }
-    env.set_attr('dynamics_belief', dynamics_belief)
 
-    # Define ground truth env
-    is_true_env = [False for _ in range(PARALLEL_ENVS)]
-    is_true_env[0] = True # leave onne env unchanged for groundtruth
-    env.set_attr('is_true_env', is_true_env)
 
-    # Fill up delay buffer
-    for _ in range(5):
-        env.call('update_delay_buffers',
-                 current_robot_state=base_env.state[0:4],
-                 action=np.array([0.0, 0.0], dtype=np.float32))
+    base_env = ContinuousNavigationEnvBase(vgraph_resolution=(10, 10),**layout_dict)
+    env = DelayedContinuousNavigationEnv.build_sync_vector_env(
+            n_envs=PARALLEL_ENVS,
+            layout_name=LAYOUT,
+            vgraph=base_env.vgraph,
+            dynamics_belief = dynamics_belief
+    )
+    # env.call('nav_state.resample_robot')
+
+
+    # env.set_attr('dynamics_belief', dynamics_belief)
+
+
+    base_env.reset()
+    env.set_attr('enable_reset', True)
+    states, _ = env.reset()
+    env.set_attr('enable_reset', False)
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     action = np.array([1, 0.5], dtype=np.float32)
 
     for t in range(1000):
-        check_uniform_buffers(env)
+        # check_uniform_buffers(env)
         # check_consistant_current_state(base_env, env)
 
         env.call('resample_robot')
-        _true_s1        = copy.deepcopy(env.get_attr('current_robot_state'))
-        _delay_s1       = copy.deepcopy(env.get_attr('delayed_robot_state'))
-        _belief_s1      = copy.deepcopy(env.call('curr_robot_state_belief'))
-        _belief_s1_hist = copy.deepcopy(env.call('curr_robot_state_belief_history'))
+        # _true_s1        = copy.deepcopy(env.get_attr('current_robot_state'))
+        # _delay_s1       = copy.deepcopy(env.get_attr('delayed_robot_state'))
+        # _belief_s1      = copy.deepcopy(env.call('curr_robot_state_belief'))
+        _belief_s1_hist = copy.deepcopy(env.call('infer_curr_robot_state_history'))
 
         # Get starting observation/state ############################################
         prev_state = base_env.state.copy()
-        obs1 = env.call('observe')[0]  # Starting observation for all possibilities  are same for all dynamic beliefs
+
+        _delay_s1  = env.call('observe')
+        obs1 = np.array(env.call('observe')[0]).copy()  # Starting observation for all possibilities  are same for all dynamic beliefs
 
         # Step envs ############################################
         new_state, _, done, _ = base_env.step(action)  # step the base env for rendering reference
         actions = np.repeat(action[np.newaxis, :], PARALLEL_ENVS, axis=0)
         possible_true_next_states, possible_rewards, terminated, truncated, info = env.step(actions)
-        env.call('update_delay_buffers', current_robot_state=prev_state[:4].copy(), action=action)
+        env.call('put_delay_buffers', current_robot_state=prev_state[:4].copy(), action=action)
 
 
         # Replay Buffer Stuff ############################################
-
+        _belief_s2 = env.call('observe')
         obs2 = env.call('observe')[0] # Consistent across all possibilities give buffer > 1
 
-        #
         # # Create prospect theory samples of reward from taking action
         reward_vals = possible_rewards[1:] # everything except true env
         reward_probs = np.array(env.get_attr('robot_prob'))[1:]
@@ -1291,7 +1506,7 @@ def main_vec():
         ##################################################################
         ##################################################################
         # Memory template for replay buffer
-        replay.add(o1, a1, reward_prospect_samples, o2, terminated[0] or truncated[0])
+        # replay.add(o1, a1, reward_prospect_samples, o2, terminated[0] or truncated[0])
 
         # Sanity Checks -
         # current_robot_state = env.get_attr('current_robot_state')
@@ -1299,36 +1514,26 @@ def main_vec():
         # assert np.all(current_robot_state[0] == current_robot_state[1]), "True robot states do not match!"
 
 
-
-
-
         # PLOTTING VALIDATION #########################
-
-
         colors = ['k', 'orange', 'green', 'red', 'purple']*3
         ax.clear()
-        # print(f'\n\nTimestep {t}'
-        #       f' \n True: {_true_s1[0]}'
-        #       f' \n {_belief_s1_hist[0]} \t')
-
-        # base_env.nav_state.update_state(*_true_s1[0])  # Update the navigation state
-        # base_env.render(ax=ax, dist_lines=True,draw_robot=False)
-
-
 
         for i in reversed(list(range(PARALLEL_ENVS))):
-            delay2belief = np.array([_delay_s1[i], _belief_s1[i]])
-            belief2next = np.array([_belief_s1[i], possible_true_next_states[i][:4]])
+            # delay2belief = np.array([_delay_s1[i], _belief_s1[i]])
+            # belief2next = np.array([_belief_s1[i][:4], possible_true_next_states[i][:4]])
+            belief2next = np.array([np.array(_belief_s1_hist[i])[-1,:4], possible_true_next_states[i][:4]])
+
+
             # true2next = np.array([_true_s1[i], true_next_state[:4]])
-
-
-
 
             if i == 0:
                 # Observed Current State
                 plt_params = {'edgecolors': 'k', 'marker': 'o', 'facecolors': 'none', 's': 150}
                 plt_params['label'] = 'Delayed State'
-                ax.scatter(_delay_s1[i][0], _delay_s1[i][1], **plt_params)
+                # ax.scatter(_delay_s1[i][0], _delay_s1[i][1], **plt_params)
+                ax.scatter(obs1[0], obs1[1], **plt_params)
+                # ax.scatter(np.array(_belief_s1_hist[i])[0, 0],
+                #            np.array(_belief_s1_hist[i])[0, 1], **plt_params)
 
                 # True Current State
                 # plt_params = {'c': 'k', 'marker': 'x', 's': 100}
@@ -1342,33 +1547,25 @@ def main_vec():
             # ax.scatter(_true_s1[i][0], _true_s1[i][1], **plt_params)
 
             plt_params = {'c': colors[i]} #  marker='o'
-            # plt_params['label'] = (f'Robot {i}' if i>0 else 'Truth') + '($t-\\tau \\rightarrow t$)'
-            # plt_params['label'] = (f'Robot {i}' if i > 0 else 'Truth') + '($t-\\tau \\rightarrow t$)'
             plt_params['ls'] = '--'
             plt_params['lw'] = '0.5'
             plt_params['marker'] = '.'
 
             # Catching up
-            ax.plot(_belief_s1_hist[i][:, 0], _belief_s1_hist[i][:, 1], **plt_params)
-
-
-
-            # plt_params['label'] = (f'Robot {i}' if i > 0 else 'Truth') + '($t\\rightarrow t+1$)'
+            ax.plot(np.array(_belief_s1_hist[i])[:, 0], np.array(_belief_s1_hist[i])[:, 1], **plt_params)
             plt_params['ls'] = '-'
             plt_params['lw'] = '1'
+
+            # This transition
             ax.plot(belief2next[:, 0], belief2next[:, 1], **plt_params)
 
-            # label = (f'Robot {i}' if i>0 else 'True Robot') + '(Delay -> Curr)'
-            # ax.plot(delay2belief[:,0],delay2belief[:,1], label=label,c =colors[i], marker='o',ls='--')
 
-            # label = (f'Robot {i}' if i > 0 else 'True Robot') + '(Curr -> Next)'
-            # ax.plot(belief2next[:, 0], belief2next[:, 1], label=label, c=colors[i], marker='o')
 
 
         # ax.set_xlim([0.4, 1.35])
         # ax.set_ylim([0.4, 1.35])
-        ax.set_xlim([_belief_s1_hist[0][0, 0] - 0.2, _belief_s1_hist[0][0, 0] + 0.2])
-        ax.set_ylim([_belief_s1_hist[0][0, 1] - 0.2, _belief_s1_hist[0][0, 1] + 0.2])
+        ax.set_xlim([np.array(_belief_s1_hist[0])[0, 0] - 0.2, np.array(_belief_s1_hist[0])[0, 0] + 0.2])
+        ax.set_ylim([np.array(_belief_s1_hist[0])[0, 1] - 0.2, np.array(_belief_s1_hist[0])[0, 1] + 0.2])
         ax.set_aspect('equal', adjustable='box')
         ax.legend(ncol=3,loc='upper right')
         plt.draw()
