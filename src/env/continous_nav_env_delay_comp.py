@@ -21,8 +21,8 @@ import matplotlib.image as mpimg
 
 class Delayed_LidarState:
     def __init__(self, X0, f_dist2goal, f_lidar, delay_steps, dt, n_rays=10,
-                 bounds = ((-np.inf,-np.inf),(np.inf,np.inf)), dynamics_belief=None,
-                 robot_state_validator = None,
+                 bounds = ((-np.inf,-np.inf),(np.inf,np.inf)),
+                 robot_state_validator = None, n_samples = 50,
                  **kwargs):
 
         # -------------------------------------------------------------------------------------------
@@ -33,13 +33,16 @@ class Delayed_LidarState:
         self._delay_steps = delay_steps             # number of delay steps to simulate
         self.robot_state_validator = robot_state_validator # function to validate robot state
 
-        if dynamics_belief is None:
-            dynamics_belief = {}
+        if 'dynamics_belief' in kwargs.keys() is None:
             warnings.warn("dynamics_belief not provided to Delayed_LidarState. Using default belief.")
+        dynamics_belief = kwargs.pop('dynamics_belief', None)
+
 
         # self.robot = make_belief_fetchrobot_mdp(**dynamics_belief) # robot dynamics model with uncertainty in parameters
+
+
         self.robot = Belief_FetchRobotMDP_Compiled(
-            n_samples = kwargs.get('n_samples', 50),
+            n_samples       = n_samples,
             b_min_lin_vel = dynamics_belief.get('b_min_lin_vel',(0.0, 1e-6) ),
             b_max_lin_vel = dynamics_belief.get('b_max_lin_vel',(1.0, 0.5) ),
             b_max_lin_acc = dynamics_belief.get('b_max_lin_acc',(0.5, 0.2) ),
@@ -649,7 +652,7 @@ class ContinousNavEnv(EnvBase):
         X0 = np.hstack([start_pos, start_velocity, start_heading])
 
         # Layout parameters ------------------------------------------------------------------------------------------
-        self.layout = kwargs.get('layout')
+        self.layout    = kwargs.pop('layout')
         self.bounds    = bounds
         self.goal      = tuple(goal)
         self.obstacles = self.format_obstacles(obstacles)
@@ -680,10 +683,27 @@ class ContinousNavEnv(EnvBase):
         self.max_dist = vgraph.max_dist
         f_dist2goal = vgraph.get_compiled_funs()
         f_lidar = Compiled_LidarFun(self.obstacles, kwargs.get('n_rays', 10))
-        self.state = Delayed_LidarState(X0, f_dist2goal, f_lidar, delay_steps, dt, bounds=self.bounds,
+        self.state = Delayed_LidarState(X0, f_dist2goal, f_lidar, delay_steps, dt,
+                                        bounds=self.bounds,
                                         robot_state_validator = self._check_collision,
+                                        dynamics_belief = kwargs.pop('dynamics_belief', None),
+                                        n_samples = kwargs.pop('n_samples', 50),
                                         **kwargs)
 
+        # Parse remaining kwargs and set attributes
+        obj_list = [self, self.state, self.state.robot]
+        for key, val in kwargs.items():
+
+            is_found = False
+            for _obj in obj_list:
+                if hasattr(_obj, key):
+                    # if _obj == self.state.robot
+                    setattr(_obj, key, val)
+                    is_found = True
+            if not is_found:
+                raise ValueError(f"Unknown kwarg {key} in ContinousNavEnv.")
+
+        # Print configuration summary
         print(f"ContinousNavEnv initialized with layout: {self.layout}")
         s = "\nBelief_FetchRobotMDP_Compiled:"
         s += f"\n  n_samples: {self.state.robot.n_samples}"

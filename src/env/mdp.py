@@ -348,31 +348,7 @@ class Compiled_LidarFun:
         u = np.array([np.cos(δ), np.sin(δ)], dtype=np.float64)  # ray direction, |u|=1
         vec = (u * min_t).astype(np.float32)  # vector from (x,y) to intersection point
         return vec
-#
-# class Compiled_LidarFun:
-#     def __init__(self, obstacles, n_rays):
-#         self.obstacles = obstacles
-#         self.n_rays = n_rays
-#         self.δrays = np.linspace(-np.pi, np.pi, self.n_rays, endpoint=False)  # lidar beam angles
-#
-#
-#     def __call__(self, X):
-#         #TODO: Need to vectorize this function
-#
-#         drays = np.zeros([X.shape[0],self.n_rays],dtype=np.float32)
-#
-#         for s, _X in enumerate(X):
-#             x, y, v, θ = _X
-#             for i, δbeam in enumerate(self.δrays):
-#                 ray_angle = θ + δbeam
-#                 dxy = get_ray2obstacle_dist(x, y, ray_angle,self.obstacles)
-#                 drays[s,i] = np.linalg.norm(dxy)
-#                 if np.linalg.norm(dxy) == 0:
-#                     print(f"{i} Warning: Lidar ray does not intersect any obstacle.")
-#
-#         return drays
-#
-#
+
 @njit
 def get_ray2obstacle_dist_circ(min_t, x, y, δ, c,r, eps = 1e-12):
     # c = np.array(obs['center'], dtype=np.float64)
@@ -437,87 +413,6 @@ def get_ray2obstacle_dist_rect(min_t, x, y, δ, cx, cy,w,h, eps=1e-12):
 
 
     return min_t
-#
-#
-# # @njit
-# def get_ray2obstacle_dist( x, y, δ, obstacles):
-#     """
-#     Cast a ray from (x, y) in direction δ (degrees) and return the 2D vector
-#     from (x, y) to the first intersection point with any obstacle.
-#     Supports:
-#       - obs['type'] == 'circle' with keys: center (x,y), radius
-#       - obs['type'] != 'circle' as axis-aligned rectangle with keys:
-#           center (x,y), width, height
-#     """
-#
-#     p = np.array([x, y], dtype=np.float64)
-#     u = np.array([np.cos(δ), np.sin(δ)], dtype=np.float64)  # ray direction, |u|=1
-#     eps = 1e-12
-#
-#     min_t = np.inf
-#
-#     for obs in obstacles:
-#         if obs['type'] == 'circle':
-#             c = np.array(obs['center'], dtype=np.float64)
-#             r = float(obs['radius'])
-#             min_t = get_ray2obstacle_dist_circ(min_t, x, y, δ, c, r)
-#
-#             # # Solve ||p + t u - c||^2 = r^2 for t >= 0
-#             # oc = p - c
-#             # # a = 1 because u is unit; b = 2 u·oc; c0 = ||oc||^2 - r^2
-#             # b = 2.0 * np.dot(u, oc)
-#             # c0 = np.dot(oc, oc) - r * r
-#             # disc = b * b - 4.0 * c0
-#             #
-#             # if disc >= 0.0:
-#             #     sqrtD = np.sqrt(max(0.0, disc))
-#             #     t1 = (-b - sqrtD) / 2.0
-#             #     t2 = (-b + sqrtD) / 2.0
-#             #     # Select smallest nonnegative root (intersection going forward)
-#             #     for t in (t1, t2):
-#             #         if t >= eps and t < min_t:
-#             #             min_t = t
-#
-#         else:
-#             # Axis-aligned rectangle
-#             cx, cy = obs['center']
-#             w, h = float(obs['width']), float(obs['height'])
-#             min_t = get_ray2obstacle_dist_rect(min_t, x, y, δ, cx, cy, w, h)
-#             # xmin, xmax = cx - w / 2.0, cx + w / 2.0
-#             # ymin, ymax = cy - h / 2.0, cy + h / 2.0
-#             #
-#             # # Intersect with the 4 lines x = xmin/xmax, y = ymin/ymax
-#             # # Keep hits where the other coordinate lies within segment bounds.
-#             # ux, uy = u
-#             # px, py = p
-#             #
-#             # # Vertical sides
-#             # if abs(ux) > eps:
-#             #     for x_edge in (xmin, xmax):
-#             #         t = (x_edge - px) / ux
-#             #         if t >= eps:
-#             #             y_at = py + t * uy
-#             #             if y_at >= ymin - eps and y_at <= ymax + eps:
-#             #                 if t < min_t:
-#             #                     min_t = t
-#             #
-#             # # Horizontal sides
-#             # if abs(uy) > eps:
-#             #     for y_edge in (ymin, ymax):
-#             #         t = (y_edge - py) / uy
-#             #         if t >= eps:
-#             #             x_at = px + t * ux
-#             #             if x_at >= xmin - eps and x_at <= xmax + eps:
-#             #                 if t < min_t:
-#             #                     min_t = t
-#
-#     # assert np.isfinite(min_t), "Ray does not intersect any obstacle."
-#
-#     if np.isfinite(min_t):
-#         warnings.warn("Ray does not intersect any obstacle.")
-#         min_t = 0  #"Ray does not intersect any obstacle."
-#     vec = (u * min_t).astype(np.float32)  # vector from (x,y) to intersection point
-#     return vec
 
 
 def main():

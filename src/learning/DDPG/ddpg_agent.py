@@ -373,7 +373,8 @@ class DDPGAgent:
                  ou_sigma=0.5,
                  ou_sigma_decay = 0.99,
                  grad_clip=None,
-                 device=None):
+                 device=None,
+                 **kwargs):
 
         self.env = env
         self.gamma = gamma
@@ -850,6 +851,9 @@ class DDPGAgent_EUT(DDPGAgent):
     """
     def __init__(self, env, **kwargs):
         super().__init__(env, **kwargs)
+        del self.rollouts_per_epi
+        del self.history
+
         self.delay_steps = self.env.delay_steps
 
         self.replay = ProspectReplayBuffer(self.state_dim, self.action_dim,
@@ -865,19 +869,19 @@ class DDPGAgent_EUT(DDPGAgent):
             'dt': self.env.dt,
             'low': -1.0,
             'high': 1.0,
-            'mode': "reflect"
+            'mode': "reflect",
+            'device': self.device
 
         }
-        ou_noise_params.update(kwargs.get('ou_noise', {}))
+        ou_noise_params.update(kwargs.pop('ou_noise', {}))
         self.ou = OUNoiseBounded(**ou_noise_params)
 
         # self.ou.sigma_decay = 0.995
         # self.ou.simulate()
 
-        del self.rollouts_per_epi
-        del self.history
 
-        self.log_interval = kwargs.get('log_interval', 10)
+
+        self.log_interval = kwargs.pop('log_interval', 10)
         self.history = {
             'ep_len': deque(maxlen=self.log_interval),
             'ep_reward': deque(maxlen=self.log_interval),
