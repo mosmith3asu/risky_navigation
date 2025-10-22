@@ -10,7 +10,10 @@ import torch.nn.functional as F
 from collections import deque
 import matplotlib.pyplot as plt
 from datetime import datetime
+
+
 from utils.file_management import save_pickle, load_pickle, load_latest_pickle, get_algorithm_dir
+from learning.utils import OUNoise,OUNoiseBounded, ReplayBuffer, ProspectReplayBuffer, Schedule
 
 # ===== Networks =====
 
@@ -28,10 +31,15 @@ class ActorDeterministic(nn.Module):
             layers += [nn.Linear(size_hidden_layers, size_hidden_layers), Act()]
         layers += [nn.Linear(size_hidden_layers, action_dim)]
         self.net = nn.Sequential(*layers)
+        self.num_hidden_layers = num_hidden_layers
+        self.size_hidden_layers = size_hidden_layers
 
     def forward(self, s):
         # output in [-1,1]; caller rescales to env bounds
         return torch.tanh(self.net(s))
+
+    def __repr__(self):
+        return f"ActorDeterministic(in:{self.net[0].in_features} -> {self.size_hidden_layers}X{self.num_hidden_layers} -> {self.net[-1].out_features}: out)"
 
 
 class CriticQ(nn.Module):
@@ -49,299 +57,18 @@ class CriticQ(nn.Module):
             layers += [nn.Linear(size_hidden_layers, size_hidden_layers), Act()]
         layers += [nn.Linear(size_hidden_layers, 1)]
         self.net = nn.Sequential(*layers)
+        self.num_hidden_layers = num_hidden_layers
+        self.size_hidden_layers = size_hidden_layers
 
     def forward(self, s, a):
         x = torch.cat([s, a], dim=-1)
         return self.net(x)
 
+    def __repr__(self):
+        return f"CriticQ([in:{self.net[0].in_features} -> {self.size_hidden_layers}X{self.num_hidden_layers} -> 1:out)"
+
 
 # ===== Utilities =====
-
-class OUNoiseBounded:
-    """
-    Ornstein–Uhlenbeck process with bounded state.
-
-    x_{t+dt} = x_t + theta*(mu - x_t)*dt + sigma*sqrt(dt)*N(0, I)
-
-    Parameters
-    ----------
-    shape : tuple or int
-        Shape of the noise state (e.g., action dimension).
-    mu : float or array-like, default 0.0
-        Long-run mean (broadcastable to `shape`).
-    theta : float, default 0.15
-        Mean-reversion rate.
-    sigma : float or array-like, default 0.2
-        Diffusion scale (broadcastable to `shape`).
-    dt : float, default 1e-2
-        Time step.
-    x0 : None or array-like
-        Initial state (bounded). If None, starts at `mu` squashed/trimmed into bounds.
-    low : float or array-like, default -1.0
-        Lower bound(s).
-    high : float or array-like, default 1.0
-        Upper bound(s).
-    mode : {"clip", "reflect", "squash"}, default "reflect"
-        Bounding mode:
-          - "clip": clip state into [low, high]
-          - "reflect": reflect back into [low, high] if overshoot occurs
-          - "squash": evolve latent z (unbounded OU), then x = low + (high-low)*(tanh(z)+1)/2
-    seed : int or None
-        Random seed.
-
-    Notes
-    -----
-    - For "squash" mode, the visible state `x` is always in [low, high] but internally the OU runs on `z`.
-    - For "reflect" mode, large overshoots are handled without bias using modulo reflection.
-
-    Methods
-    -------
-    reset(x0=None): Reset the process state.
-    sample(): Step once and return the new bounded state.
-    __call__(): Alias of `sample()`.
-    state: Property to inspect current bounded state.
-    """
-
-    def __init__(self, shape,
-                 mu=0.0, theta=0.15, sigma=0.2, dt=1e-2,
-                 sigma_min=0.05, sigma_decay=.995,
-
-                 x0=np.array([0,0]),
-                 low=-1.0, high=1.0, mode="reflect",
-                 device = 'cpu',seed=None):
-        self.shape = (shape,) if isinstance(shape, int) else tuple(shape)
-        self.theta = float(theta)
-        self.dt = float(dt)
-        self.mu = np.broadcast_to(np.asarray(mu, dtype=float), self.shape)
-        self.sigma = np.broadcast_to(np.asarray(sigma, dtype=float), self.shape)
-        self.sigma_min = sigma_min
-        self.sigma_decay = sigma_decay
-        self.device = device
-        self.low = np.broadcast_to(np.asarray(low, dtype=float), self.shape)
-        self.high = np.broadcast_to(np.asarray(high, dtype=float), self.shape)
-        if np.any(self.high <= self.low):
-            raise ValueError("All elements of `high` must be greater than `low`.")
-
-        self.mode = str(mode).lower()
-        if self.mode not in {"clip", "reflect", "squash"}:
-            raise ValueError("mode must be 'clip', 'reflect', or 'squash'.")
-
-        self.rng = np.random.default_rng(seed)
-
-        # State variables
-        self._x = None           # visible (bounded) state
-        self._z = None           # latent (for squash mode)
-        self._x0 = x0
-        self.reset()
-
-    # ---------- Public API ----------
-
-    def reset(self):
-        x0 = self._x0
-        """Reset the process. If x0 is None, start from mu (bounded)."""
-        if self.mode == "squash":
-            # initialize latent z so that tanh(z) maps near mu within bounds
-            # invert the squash around midpoint:
-            mid = (self.low + self.high) / 2.0
-            half = (self.high - self.low) / 2.0
-            target = np.clip((self.mu - mid) / np.maximum(half, 1e-12), -0.999999, 0.999999)
-            self._z = np.arctanh(target)
-            self._x = self._squash(self._z) if x0 is None else self._clip_into_bounds(np.asarray(x0, float))
-        else:
-            start = self.mu if x0 is None else np.asarray(x0, dtype=float)
-            self._x = self._clip_into_bounds(start)
-            self._z = None
-
-        dsig = - self.sigma * (1 - self.sigma_decay)
-        sigma = self.sigma + (dsig)
-        self.sigma = np.max([self.sigma_min*np.ones_like(sigma), sigma],axis=0)
-        return self._x.copy()
-
-    def sample(self):
-        """Advance one step and return the new bounded state."""
-        n = self.rng.standard_normal(self.shape)
-        if self.mode == "squash":
-            # OU on latent z, then squash to bounded x
-            self._z = self._z + self.theta * (0.0 - self._z) * self.dt + self.sigma * np.sqrt(self.dt) * n
-            self._x = self._squash(self._z)
-        else:
-            # OU directly on bounded x, then bound via clip or reflect
-            x = self._x + self.theta * (self.mu - self._x) * self.dt + self.sigma * np.sqrt(self.dt) * n
-            if self.mode == "clip":
-                self._x = self._clip_into_bounds(x)
-            elif self.mode == "reflect":
-                self._x = self._reflect_into_bounds(x)
-        return torch.tensor(self._x.copy(), dtype=torch.float32, device=self.device)
-
-    def __call__(self):
-        return self.sample()
-
-    @property
-    def state(self):
-        """Current bounded state (copy)."""
-        return None if self._x is None else self._x.copy()
-
-    # ---------- Utilities ----------
-
-    def _clip_into_bounds(self, x):
-        return np.clip(x, self.low, self.high)
-
-    def _reflect_into_bounds(self, x):
-        """
-        Vectorized reflection into [low, high] handling large overshoots:
-        Maps x using sawtooth reflection with period 2*width.
-        """
-        width = self.high - self.low
-        # Avoid /0 if any widths are zero (already checked above, but guard anyway)
-        width = np.maximum(width, 1e-12)
-        y = (x - self.low) % (2.0 * width)
-        y_ref = np.where(y <= width, self.low + y, self.high - (y - width))
-        return y_ref
-
-    def _squash(self, z):
-        """Map latent z in R smoothly to [low, high] via tanh."""
-        half = (self.high - self.low) / 2.0
-        mid = (self.high + self.low) / 2.0
-        return mid + half * np.tanh(z)
-
-
-class OUNoise:
-    """
-    Ornstein–Uhlenbeck noise for exploration.
-    Handles both single env and vectorized envs by broadcasting on shape.
-    - theta: rate of mean reversion (returns noise to mu)
-    - sigma: scale of noise
-    """
-    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.5, n_envs=1,
-                 sigma_min = 0.05, sigma_decay=.995, device='cpu'):
-
-
-        self.action_dim = action_dim
-        self.mu = mu
-        self.theta = theta
-        self.sigma = sigma
-        self.sigma_min = sigma_min
-        self.sigma_decay = sigma_decay
-        # self.dt = dt
-        self.n_envs = n_envs
-        self.device = device
-        self.size = (self.n_envs, self.action_dim)
-        self.reset()
-
-    def reset(self,i=None):
-        if i is None:
-            self.state = self.mu * torch.zeros(self.n_envs, self.action_dim, device=self.device)
-        else:
-            self.state[i] = 0
-
-        dsig = - self.sigma * ( 1-self.sigma_decay)
-        sigma = self.sigma + (dsig)/self.n_envs
-        self.sigma = max(self.sigma_min, sigma)
-
-    def sample(self):
-        x = self.state
-        # dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0,1,self.size,device=self.device)
-        dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0, 1, self.size, device=self.device)
-        self.state = x + dx
-        return self.state
-
-    def simulate(self,T=600):
-        n_trials = 3
-        self.reset()
-        # self.theta = 1
-        # self.sigma = 0.05
-        fig,axs = plt.subplots(self.action_dim,n_trials)
-
-        for trial in range(n_trials):
-            data = np.zeros((T, self.action_dim))
-            # xy = np.array([[0.0,0.0]])
-
-            for t in range(T):
-                xy = np.array([[0.0, 0.0]])
-                xy += self.sample().cpu().numpy()
-                data[t,:] = xy
-            # plot data
-            for d in range(self.action_dim):
-                axs[d,trial].plot(data[:,d])
-                axs[d,trial].set_title(f'OU Noise Dimension {["x","y"][d]}')
-                axs[d,trial].hlines(0, xmin=0, xmax=T, colors='k', linestyles='dashed', alpha=0.5)
-                axs[d,trial].set_xlabel('Timestep')
-
-
-        plt.show()
-
-
-
-
-class ReplayBuffer:
-    def __init__(self, obs_dim, act_dim, size=int(1e6), device='cpu'):
-        self.device = device
-        self.size = size
-        self.ptr = 0
-        self.full = False
-        self.s = torch.zeros((size, obs_dim), dtype=torch.float32, device=device)
-        self.a = torch.zeros((size, act_dim), dtype=torch.float32, device=device)
-        self.r = torch.zeros((size, 1), dtype=torch.float32, device=device)
-        self.s2 = torch.zeros((size, obs_dim), dtype=torch.float32, device=device)
-        self.d = torch.zeros((size, 1), dtype=torch.float32, device=device)
-
-    def add(self, s, a, r, s2, d):
-        n = s.shape[0] if s.ndim == 2 else 1
-        # ensure batched
-        s = torch.as_tensor(s, dtype=torch.float32, device=self.device)
-        a = torch.as_tensor(a, dtype=torch.float32, device=self.device)
-        r = torch.as_tensor(r, dtype=torch.float32, device=self.device).view(-1, 1)
-        s2 = torch.as_tensor(s2, dtype=torch.float32, device=self.device)
-        d = torch.as_tensor(d, dtype=torch.float32, device=self.device).view(-1, 1)
-
-        idxs = (self.ptr + torch.arange(n, device=self.device)) % self.size
-        self.s[idxs] = s
-        self.a[idxs] = a
-        self.r[idxs] = r
-        self.s2[idxs] = s2
-        self.d[idxs] = d
-
-        self.ptr = (self.ptr + n) % self.size
-        if self.ptr == 0:
-            self.full = True
-
-    def __len__(self):
-        return self.size if self.full else self.ptr
-
-    def sample(self, batch_size):
-        max_idx = self.size if self.full else self.ptr
-        idxs = torch.randint(0, max_idx, (batch_size,), device=self.device)
-        return self.s[idxs], self.a[idxs], self.r[idxs], self.s2[idxs], self.d[idxs]
-
-
-
-class ProspectReplayBuffer(ReplayBuffer):
-    def __init__(self, obs_dim, act_dim, n_samples, size=int(1e6), device='cpu'):
-        super().__init__(obs_dim, act_dim, size, device)
-        prospect_dim = 2 # [reward, prob]
-        self.r = torch.zeros((size, prospect_dim, n_samples), dtype=torch.float32, device=device)
-        self.d = torch.zeros((size, 1, n_samples), dtype=torch.float32, device=device)
-
-    def add(self, s, a, r, s2, d):
-
-        n = s.shape[0] if s.ndim == 2 else 1
-        # ensure batched
-        s = torch.as_tensor(s, dtype=torch.float32, device=self.device)
-        a = torch.as_tensor(a, dtype=torch.float32, device=self.device)
-        r = torch.as_tensor(r, dtype=torch.float32, device=self.device)
-        s2 = torch.as_tensor(s2, dtype=torch.float32, device=self.device)
-        d = torch.as_tensor(d, dtype=torch.float32, device=self.device).view(-1, 1)
-
-        idxs = (self.ptr + torch.arange(n, device=self.device)) % self.size
-        self.s[idxs] = s
-        self.a[idxs] = a
-        self.r[idxs] = r
-        self.s2[idxs] = s2
-        self.d[idxs] = d.reshape(1,-1)
-
-        self.ptr = (self.ptr + n) % self.size
-        if self.ptr == 0:
-            self.full = True
 
 
 def soft_update(target, source, tau):
@@ -385,6 +112,7 @@ class DDPGAgent:
         self.rollouts_per_epi = rollouts_per_epi
         self.warmup_epis = warmup_epis
         self.random_start_epis = random_start_epis
+        self.start_time_str = datetime.now().strftime("%Y-%m-%d TIME: %H:%M:%S")
 
         # dims
         self.state_dim  = env.observation_space.shape[0]
@@ -445,6 +173,9 @@ class DDPGAgent:
     # ----- optimization -----
 
     def _update_sgd(self, updates=1):
+        mean_critic_loss = 0.0
+        mean_actor_loss  = 0.0
+
         for _ in range(updates):
             if len(self.replay) < self.batch_size:
                 return
@@ -476,6 +207,11 @@ class DDPGAgent:
             # Targets
             soft_update(self.actor_targ, self.actor, self.tau)
             soft_update(self.critic_targ, self.critic, self.tau)
+
+            mean_critic_loss += critic_loss.item()
+            mean_actor_loss += actor_loss.item()
+
+        return mean_critic_loss / updates, mean_actor_loss / updates
 
     # ----- training loop -----
 
@@ -552,32 +288,40 @@ class DDPGAgent:
 
         return {"avg_return": np.mean(ep_returns), "avg_len": np.mean(ep_lens)}
 
+    def _spawn_figure(self):
+        plt.ion()
+        self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 4))
+        self.fig.suptitle(f'DDPG ({self.start_time_str})')
+        self.rew_ax = self.axes[0, 0]
+        self.render_ax = self.axes[0, 1]
+        self.loss_ax = self.axes[1, 0]
+
     def _plot_history(self,
                       traj_history, terminal_history,
                       filt_reward_history,
                       env = None,
                       lw = 0.5,
-                      tpause=0.1):
+                      tpause=0.1,
+                      log_interval=1):
 
         env = env or self.env
 
         if self.fig is None:
-            plt.ion()
-            self.fig, self.axes = plt.subplots(1, 2, figsize=(10, 4))
+            self._spawn_figure()
 
-        x = np.arange(len(filt_reward_history))
+        x = np.arange(len(filt_reward_history)) * log_interval
         mean, std = filt_reward_history[:,0],filt_reward_history[:,1]
 
         # Reward plot
         if 'reward_line' not in self.fig_assets.keys():
             # self.fig_assets['reward_line'] = self.axes[0].plot(list(self.reward_history),lw=1,color='b')[0]
-            self.fig_assets['reward_line'] = self.axes[0].plot(x,mean, lw=lw, color='k')[0]
-            self.axes[0].set_title('Reward (eps)')
-            self.axes[0].set_xlabel('Episode')
-            self.axes[0].set_ylabel('Total Reward')
+            self.fig_assets['reward_line'] = self.rew_ax.plot(x,mean, lw=lw, color='k')[0]
+            self.rew_ax.set_title('Reward (eps)')
+            self.rew_ax.set_xlabel('Episode')
+            self.rew_ax.set_ylabel('Total Reward')
 
             # plot 1 std deviation as shaded region
-            self.fig_assets['reward_patch'] = self.axes[0].fill_between( x, mean - std, mean + std,
+            self.fig_assets['reward_patch'] = self.rew_ax.fill_between( x, mean - std, mean + std,
                 color='b',  alpha=0.2
                                                                          )
 
@@ -585,7 +329,7 @@ class DDPGAgent:
         else:
             self.fig_assets['reward_line'].set_data(x, mean)
             self.fig_assets['reward_patch'].remove()
-            self.fig_assets['reward_patch'] = self.axes[0].fill_between(
+            self.fig_assets['reward_patch'] = self.rew_ax.fill_between(
                 x,
                 mean - std,
                 mean + std,
@@ -593,18 +337,18 @@ class DDPGAgent:
                 alpha=0.2
 
             )
-            self.axes[0].relim()
-            self.axes[0].autoscale_view()
+            self.rew_ax.relim()
+            self.rew_ax.autoscale_view()
 
 
         # # Trajectories
         if 'traj_lines' not in self.fig_assets.keys():
             env.reset(**self.reset_params)
             if hasattr(env, 'num_envs'):
-                env.call('render', ax=self.axes[1]) # retrieve vec render
+                env.call('render', ax=self.render_ax) # retrieve vec render
             else:
 
-                env.render(ax=self.axes[1],draw_dist2goal=False, draw_lidar=False) # single env render
+                env.render(ax=self.render_ax,draw_dist2goal=False, draw_lidar=False) # single env render
 
             self.fig_assets['traj_lines'] = []
             for (traj,term) in zip(traj_history,terminal_history):
@@ -612,10 +356,10 @@ class DDPGAgent:
                 elif 'collision' in term: plt_params = {'color':'red', 'alpha': 0.7,  'lw':lw}
                 elif term == 'max_steps': plt_params = {'color':'gray', 'alpha': 0.7,  'lw':lw}
                 else: raise ValueError(f"Unknown terminal cause: {term}")
-                self.fig_assets['traj_lines'].append(self.axes[1].plot(traj[:,0], traj[:,1], **plt_params)[0])
+                self.fig_assets['traj_lines'].append(self.render_ax.plot(traj[:,0], traj[:,1], **plt_params)[0])
 
-            self.axes[1].set_title('Trajectories (last {} eps)'.format(len(traj_history)))
-            self.axes[1].set_xlabel('X'); self.axes[1].set_ylabel('Y')
+            self.render_ax.set_title('Trajectories (last {} eps)'.format(len(traj_history)))
+            self.render_ax.set_xlabel('X'); self.render_ax.set_ylabel('Y')
         else:
             for i, traj, term in zip(np.arange(len(traj_history)),traj_history, terminal_history):
                 if term == 'goal_reached':  plt_params = {'color': 'green', 'alpha': 0.7,'lw':2*lw}
@@ -626,6 +370,40 @@ class DDPGAgent:
                 self.fig_assets['traj_lines'][i].set_data(traj[:, 0], traj[:, 1])
                 self.fig_assets['traj_lines'][i].set_color(plt_params['color'])
                 self.fig_assets['traj_lines'][i].set_alpha(plt_params['alpha'])
+
+        plt.tight_layout()
+        plt.draw()
+        plt.pause(tpause)
+
+    def _plot_losses(self,
+                     actor_loss_history,
+                     critic_loss_history, tpause=0.1, log_interval=1):
+
+        if self.fig is None:
+            self._spawn_figure()
+
+        # Plot a dual axis loss plot
+        x = np.arange(len(actor_loss_history)) * log_interval
+        if 'actor_loss_line' not in self.fig_assets.keys():
+            self.fig_assets['actor_loss_line'], = self.loss_ax.plot(x, actor_loss_history, color='b', label='Actor Loss')
+            self.loss_ax.set_xlabel('Episode')
+            self.loss_ax.set_ylabel('Actor Loss', color='b')
+            self.loss_ax.tick_params(axis='y', labelcolor='b')
+
+            self.loss_ax2 = self.loss_ax.twinx()
+            self.fig_assets['critic_loss_line'], = self.loss_ax2.plot(x, critic_loss_history, color='r', label='Critic Loss')
+            self.loss_ax2.set_ylabel('Critic Loss', color='r')
+            self.loss_ax2.tick_params(axis='y', labelcolor='r')
+
+            # self.loss_ax.set_title('Losses (eps)')
+        else:
+            self.fig_assets['actor_loss_line'].set_data(x, actor_loss_history)
+            self.fig_assets['critic_loss_line'].set_data(x, critic_loss_history)
+            self.loss_ax.relim()
+            self.loss_ax.autoscale_view()
+            self.loss_ax2.relim()
+            self.loss_ax2.autoscale_view()
+
 
         plt.tight_layout()
         plt.draw()
@@ -674,11 +452,308 @@ class DDPGAgent:
         self.critic_targ.load_state_dict(load_dict['critic_targ'])
         print(f"\nObject loaded from {fpath}\n")
 
+    def __repr__(self):
+        s = f"{self.__class__.__name__}({self.start_time_str})"
+        s += f"\n\t| Device: {self.device}"
+        s += f"\n\t| Actor: {self.actor}"
+        s += f"\n\t| Critic: {self.critic}"
+        s += f"\n\t| dt: {self.env.dt}"
+        return s
+
+
 # ===== Agent (vectorized env) =====
+
+
+class DDPGAgent_EUT(DDPGAgent):
+    """
+    Rational (Expected unitlity) agent that computes the expected utility over a distribution of rewards from dynamics models.
+    """
+    def __init__(self, env, **kwargs):
+        super().__init__(env, **kwargs)
+        del self.rollouts_per_epi
+        del self.history
+
+        self.delay_steps = self.env.delay_steps
+        self.update_interval = kwargs.pop('update_interval', 1)
+
+
+        self.replay = ProspectReplayBuffer(self.state_dim,
+                                           self.action_dim,
+                                           n_samples=self.env.n_samples,
+                                           size=self.replay.size, device=self.device)
+        ou_noise_params = {
+            'shape': self.action_dim,
+            'mu': 0.0,
+            'theta': 0.15,
+            'sigma': 0.5,
+            'sigma_decay': 0.99,
+            'sigma_min': 0.05,
+            'dt': self.env.dt,
+            'low': (-0.5, -0.5),
+            'high': (0.5, 0.75), # bias to drive forward
+            # 'low': -1.0,
+            # 'high': 1.0,
+            'mode': "squash",
+            'device': self.device,
+            'decay_freq': None # (decay on reset)
+
+        }
+        ou_noise_params.update(kwargs.pop('ou_noise', {}))
+        # self.ou = OUNoiseBounded(**ou_noise_params)
+        self.ou = OUNoise(**ou_noise_params)
+
+        # self.ou.sigma_decay = 0.995
+        # self.ou.simulate()
+
+        def_rand_start_sched_params = {
+            'xstart': 1,
+            'xend': 0,
+            'horizon': self.random_start_epis,
+            'mode': 'linear',
+            # 'mode': 'exponential',
+            # 'exp_gain': 2, # higher gain=faster decay
+        }
+        rand_start_sched_params = kwargs.pop('rand_start_sched', def_rand_start_sched_params)
+        rand_start_sched_params.update({'name':'rand_start_sched'})
+        self.rand_start_sched = Schedule(**rand_start_sched_params)
+
+        self.log_interval = kwargs.pop('log_interval', 10)
+        self.history = {
+            'ep_len': deque(maxlen=self.log_interval),
+            'ep_reward': deque(maxlen=self.log_interval),
+            'action': deque(maxlen=self.log_interval),
+            'xy': deque(maxlen=self.log_interval),
+            'terminal': deque(maxlen=self.log_interval),
+            'timeseries_filt_rewards': np.zeros([0, 2]),
+            'critic_loss': [],
+            'actor_loss': []
+        }
+
+
+        self.reset_params = {
+            'rand_action_gen': self.rand_action_gen
+        }
+
+
+    def rand_action_gen(self,*args, **kwargs):
+        self.ou.reset()
+        a = self.ou.sample(*args, **kwargs).cpu().numpy()
+        self.ou.reset()
+        return a
+
+    def warmup(self):
+        _spin = ['-','|','\\','-','/']
+
+        for ep in range(self.warmup_epis):
+            print(f'\r [{_spin[ep%len(_spin)]}] Running Warmup... [Prog: {int(ep/self.warmup_epis*100)}%]',end='',flush=True)
+
+            # RESETS
+            self.env.reset(p_rand_state = 1 if self.random_start_epis>0 else 0, **self.reset_params)
+            self.ou.reset()
+
+
+            i=0
+            while i <= self.env.max_steps:
+                o1 = self.env.observation
+
+                # Step envs ############################################
+                a_pt = self.ou.sample()
+                # a = np.random.uniform(self.a_low.cpu().numpy(), self.a_high.cpu().numpy(),size=(self.action_dim)).astype(np.float32)
+                ns_samples, r_samples, done_samples, info = self.env.step(a_pt.cpu().numpy().flatten())
+
+                o2 = self.env.observation
+
+                # Create transition prospects and store in mem ################################
+                r_probs = np.array(self.env.robot_probs)
+                r_prospects = np.vstack([r_samples, r_probs])
+
+                self.replay.add(o1, a_pt, r_prospects, o2, done_samples)
+
+                i += 1
+                if info['true_done']:
+                    break
+        print('\n')
+        self.ou.reset_sigma()
+
+    def train(self, max_episodes=1_000):
+        self.warmup()
+
+        running_rewards = 0
+        running_xys = deque(maxlen=self.env.max_steps)
+        running_acts = deque(maxlen=self.env.max_steps)
+        running_actor_loss = deque(maxlen=self.env.max_steps)
+        running_critic_loss = deque(maxlen=self.env.max_steps)
+
+        for ep in range(1, max_episodes + 1):
+            p_rand_state = self.rand_start_sched.sample(at=ep)
+            # p_rand_state = max(0, (1 - ep / self.random_start_epis) if self.random_start_epis>0 else 0)
+            self.env.reset(p_rand_state = p_rand_state,**self.reset_params)
+            self.ou.reset()
+
+
+
+            # ----------------------------------------------------------------------------
+            for i in range(self.env.max_steps):
+                # Observe and act ############################################
+                o1 = self.env.observation
+                o1_pt = torch.tensor(o1, dtype=torch.float32, device=self.device)
+
+                a1_pt = self._act(o1_pt, explore=True)
+                a1 = a1_pt.cpu().numpy().flatten()
+
+                # Step env ############################################
+                ns_samples, r_samples, done_samples, info = self.env.step(a1)
+                o2 = self.env.observation
+                o2_pt = torch.tensor(o2, dtype=torch.float32, device=self.device)
+
+                # Create transition prospects, store in mem, and update ################################
+                r_probs = np.array(self.env.robot_probs)
+                r_prospects = np.vstack([r_samples, r_probs])
+                self.replay.add(o1_pt, a1_pt, r_prospects, o2_pt, done_samples)
+
+                # self._update_sgd()
+                if i % self.update_interval == 0:
+                    critic_loss,actor_loss = self._update_sgd()
+                    running_actor_loss.append(actor_loss)
+                    running_critic_loss.append(critic_loss)
+
+
+                # Log for reporting #########################################################
+                running_rewards += info['true_reward']
+                running_xys.append(info['true_next_state'][0,:2])
+                running_acts.append(a1)
+
+                if info['true_done']:
+                    self.history['terminal'].append(info['true_reason'])
+                    self.history['ep_len'].append(i)
+                    self.history['ep_reward'].append(running_rewards);  running_rewards = 0
+                    self.history['xy'].append(np.array(running_xys));   running_xys.clear()
+                    self.history['action'].append(np.mean(np.array(running_acts),axis=0)); running_acts.clear()
+                    self.history['actor_loss'].append(np.mean(np.array(running_actor_loss)) if len(running_actor_loss)>0 else 0.0)
+                    self.history['critic_loss'].append(np.mean(np.array(running_critic_loss)) if len(running_critic_loss)>0 else 0.0)
+                    running_actor_loss.clear()
+                    running_critic_loss.clear()
+
+
+                    if info['true_reason'] == 'max_steps':
+                        self.env.state.add_random_robot_state(
+                            observation = info['true_next_state']
+                        )
+                    break
+
+                # o1    = o2.copy()
+                # o1_pt = o2_pt
+
+                # end timestep ---------------------------------------------------------------
+
+
+            # LOG EPISODE #################################################################
+            print(f"[DDPG] Episode {ep} ({i} it; {i * self.env.dt:.1f}sec)"
+                  f"| AvgRet: {np.mean(self.history['ep_reward']):.2f} "
+                  f"| MemLen: {len(self.replay)}"
+                  f"| P(rand state):{p_rand_state:.2f}"
+                  f"| OU(sigma): {np.mean(self.ou.sigma): .3f}"
+                  f"| Terminal: {self.history['terminal'][-1]}"
+                  f"| Mean Act: {np.round(self.history['action'][-1],2)}"
+                  )
+
+            if ep % self.log_interval == 0:
+                print("")
+                mu, std = np.mean(self.history['ep_reward']), np.std(self.history['ep_reward'])
+                self.history['timeseries_filt_rewards'] = np.vstack((
+                    self.history['timeseries_filt_rewards'],
+                    np.array([[mu, std]]))
+                )
+
+                self._plot_history(traj_history=self.history['xy'],
+                                   terminal_history=self.history['terminal'],
+                                   filt_reward_history=self.history['timeseries_filt_rewards'],
+                                   log_interval=self.log_interval)
+                self._plot_losses(
+                    actor_loss_history=self.history['actor_loss'],
+                    critic_loss_history=self.history['critic_loss'],
+                    log_interval=self.log_interval
+                )
+
+                self.history['terminal'].clear()
+                self.history['ep_len'].clear()
+                self.history['ep_reward'].clear()
+                self.history['xy'].clear()
+
+
+        # return {"avg_return": np.mean(ep_returns), "avg_len": np.mean(ep_lens)}
+
+        # ----- optimization -----
+
+    def risk_measure(self,vals,probs):
+        return torch.sum(vals*probs, dim=1).squeeze() # rational expectation
+
+    def _update_sgd(self, updates=1):
+        mean_critic_loss = 0.0
+        mean_actor_loss = 0.0
+
+        for _ in range(updates):
+            if len(self.replay) < self.batch_size:
+                return 0,0
+
+            o1, a1, r_prospects, o2, d_prospects = self.replay.sample(self.batch_size)
+
+            with torch.no_grad():
+                a2 = self._scale_to_bounds(self.actor_targ(o2))
+                q_targ = self.critic_targ(o2, a2)
+
+                r_vals,r_probs = [r_prospects[:,i,:] for i in range(2)]
+                assert torch.all(torch.sum(r_probs, dim=1) == 1), 'Reward probabilities do not sum to 1.'
+
+                d_prospects = d_prospects.squeeze(1)
+                # assert r_vals.shape == r_probs.shape == d_prospects.shape, ''
+                td_targets = r_vals + (1.0 - d_prospects) * self.gamma * q_targ
+                td_expectation = self.risk_measure(td_targets, r_probs)
+                assert td_expectation.shape == (self.batch_size,)
+
+                # y = r + (1.0 - d) * self.gamma * q_targ
+
+            # Critic
+            q = self.critic(o1, a1).squeeze()
+
+            critic_loss = F.mse_loss(q, td_expectation)
+            assert np.isfinite(critic_loss.item()), f'Non-finite critic loss: {critic_loss.item()}'
+
+            self.optimC.zero_grad()
+            critic_loss.backward()
+            if self.grad_clip:
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
+            self.optimC.step()
+
+            # Actor (maximize Q(s, pi(s)) -> minimize -Q)
+            a_pred = self._scale_to_bounds(self.actor(o1))
+            actor_loss = -self.critic(o1, a_pred).mean()
+            self.optimA.zero_grad()
+            actor_loss.backward()
+            if self.grad_clip:
+                nn.utils.clip_grad_norm_((self.actor.parameters()), self.grad_clip)
+            self.optimA.step()
+
+            # Targets
+            soft_update(self.actor_targ, self.actor, self.tau)
+            soft_update(self.critic_targ, self.critic, self.tau)
+
+            mean_critic_loss += critic_loss.item()
+            mean_actor_loss += actor_loss.item()
+
+        return mean_critic_loss / updates, mean_actor_loss / updates
+
+    def __str__(self):
+        s = super().__str__()
+        s += str(self.ou) + f'\n'
+        s += str(self.rand_start_sched) + f'\n'
+        s += str(self.env) + f'\n'
+        return s
 
 class DDPGAgentVec(DDPGAgent):
     """
     Vectorized DDPG. Mirrors your A2CAgentVec patterns (env is Sync/AsyncVectorEnv).
+    NOT DELAYED!!
     """
     def __init__(self, envs, **kwargs):
         super().__init__(envs, **kwargs)
@@ -845,211 +920,10 @@ class DDPGAgentVec(DDPGAgent):
         # return {"avg_return": np.mean(ep_returns), "avg_len": np.mean(ep_lens)}
 
 
-class DDPGAgent_EUT(DDPGAgent):
-    """
-    Rational (Expected unitlity) agent that computes the expected utility over a distribution of rewards from dynamics models.
-    """
-    def __init__(self, env, **kwargs):
-        super().__init__(env, **kwargs)
-        del self.rollouts_per_epi
-        del self.history
+############################################################################################
+# Deprecated: Vectorized DDPG Agent ########################################################
+############################################################################################
 
-        self.delay_steps = self.env.delay_steps
-
-        self.replay = ProspectReplayBuffer(self.state_dim, self.action_dim,
-                                           n_samples=self.env.n_samples,
-                                           size=self.replay.size, device=self.device)
-        ou_noise_params = {
-            'shape': self.action_dim,
-            'mu': 0.0,
-            'theta': 0.15,
-            'sigma': 0.5,
-            'sigma_decay': 0.995,
-            'sigma_min': 0.05,
-            'dt': self.env.dt,
-            'low': -1.0,
-            'high': 1.0,
-            'mode': "reflect",
-            'device': self.device
-
-        }
-        ou_noise_params.update(kwargs.pop('ou_noise', {}))
-        self.ou = OUNoiseBounded(**ou_noise_params)
-
-        # self.ou.sigma_decay = 0.995
-        # self.ou.simulate()
-
-
-
-        self.log_interval = kwargs.pop('log_interval', 10)
-        self.history = {
-            'ep_len': deque(maxlen=self.log_interval),
-            'ep_reward': deque(maxlen=self.log_interval),
-            'action': deque(maxlen=self.log_interval),
-            'xy': deque(maxlen=self.log_interval),
-            'terminal': deque(maxlen=self.log_interval),
-            'timeseries_filt_rewards': np.zeros([0, 2]),
-        }
-
-
-
-    def warmup(self):
-        _spin = ['-','|','\\','-','/']
-
-        for ep in range(self.warmup_epis):
-            print(f'\r [{_spin[ep%len(_spin)]}] Running Warmup... [Prog: {int(ep/self.warmup_epis*100)}%]',end='',flush=True)
-
-            # RESETS
-            self.env.reset(p_rand_state = 1 if self.random_start_epis>0 else 0)
-
-            i=0
-            while i <= self.env.max_steps:
-                o1 = self.env.observation
-
-                # Step envs ############################################
-                a = np.random.uniform(self.a_low.cpu().numpy(), self.a_high.cpu().numpy(),size=(self.action_dim)).astype(np.float32)
-                ns_samples, r_samples, done_samples, info = self.env.step(a)
-
-                o2 = self.env.observation
-
-                # Create transition prospects and store in mem ################################
-                r_probs = np.array(self.env.robot_probs)
-                r_prospects = np.vstack([r_samples, r_probs])
-
-                self.replay.add(o1, a, r_prospects, o2, done_samples)
-
-                i += 1
-                if info['true_done']:
-                    break
-        print('\n')
-
-    def train(self, max_episodes=1_000):
-        self.warmup()
-
-        running_rewards = 0
-        running_xys = deque(maxlen=self.env.max_steps)
-
-        for ep in range(1, max_episodes + 1):
-            p_rand_state = max(0, (1 - ep / self.random_start_epis) if self.random_start_epis>0 else 0)
-            self.env.reset(p_rand_state = p_rand_state)
-            self.ou.reset()
-
-            o1 = self.env.observation
-            o1_pt = torch.tensor(o1, dtype=torch.float32, device=self.device)
-
-            # ----------------------------------------------------------------------------
-            for i in range(self.env.max_steps):
-                # Observe and act ############################################
-                a1_pt = self._act(o1_pt, explore=True)
-                a1 = a1_pt.cpu().numpy().flatten()
-
-                # Step env ############################################
-                ns_samples, r_samples, done_samples, info = self.env.step(a1)
-                o2 = self.env.observation
-                o2_pt = torch.tensor(o2, dtype=torch.float32, device=self.device)
-
-                # Create transition prospects, store in mem, and update ################################
-                r_probs = np.array(self.env.robot_probs)
-                r_prospects = np.vstack([r_samples, r_probs])
-                self.replay.add(o1_pt, a1_pt, r_prospects, o2_pt, done_samples)
-                self._update_sgd()
-
-                # Log for reporting #########################################################
-                running_rewards += info['true_reward']
-                running_xys.append(info['true_next_state'][0,:2])
-
-                if info['true_done']:
-                    self.history['terminal'].append(info['true_reason'])
-                    self.history['ep_len'].append(i)
-                    self.history['ep_reward'].append(running_rewards);  running_rewards = 0
-                    self.history['xy'].append(np.array(running_xys));   running_xys.clear()
-                    break
-
-                # o1    = o2.copy()
-                o1_pt = o2_pt
-
-                # end timestep ---------------------------------------------------------------
-
-
-            # LOG EPISODE #################################################################
-            print(f"[DDPG] Episode {ep} ({i} it; {i * self.env.dt:.1f}sec)"
-                  f"| AvgRet: {np.mean(self.history['ep_reward']):.2f} "
-                  f"| MemLen: {len(self.replay)}"
-                  f"| P(rand state):{p_rand_state:.2f}"
-                  f"| OU(sigma): {np.mean(self.ou.sigma): .3f}"
-                  f"| Terminal: {self.history['terminal'][-1]}"
-                  )
-
-            if ep % self.log_interval == 0:
-                print("")
-                mu, std = np.mean(self.history['ep_reward']), np.std(self.history['ep_reward'])
-                self.history['timeseries_filt_rewards'] = np.vstack((
-                    self.history['timeseries_filt_rewards'],
-                    np.array([[mu, std]]))
-                )
-
-                self._plot_history(traj_history=self.history['xy'],
-                                   terminal_history=self.history['terminal'],
-                                   filt_reward_history=self.history['timeseries_filt_rewards'], )
-
-                self.history['terminal'].clear()
-                self.history['ep_len'].clear()
-                self.history['ep_reward'].clear()
-                self.history['xy'].clear()
-
-
-        # return {"avg_return": np.mean(ep_returns), "avg_len": np.mean(ep_lens)}
-
-        # ----- optimization -----
-
-    def risk_measure(self,vals,probs):
-        return torch.sum(vals*probs, dim=1).squeeze() # rational expectation
-
-    def _update_sgd(self, updates=1):
-        for _ in range(updates):
-            if len(self.replay) < self.batch_size:
-                return
-            o1, a1, r_prospects, o2, d_prospects = self.replay.sample(self.batch_size)
-
-            with torch.no_grad():
-                a2 = self._scale_to_bounds(self.actor_targ(o2))
-                q_targ = self.critic_targ(o2, a2)
-
-                r_vals,r_probs = [r_prospects[:,i,:] for i in range(2)]
-                d_prospects = d_prospects.squeeze(1)
-                assert r_vals.shape == r_probs.shape == d_prospects.shape, ''
-                td_targets = r_vals + (1.0 - d_prospects) * self.gamma * q_targ
-                td_expectation = self.risk_measure(td_targets, r_probs)
-                assert td_expectation.shape == (self.batch_size,)
-
-                # y = r + (1.0 - d) * self.gamma * q_targ
-
-            # Critic
-            q = self.critic(o1, a1).squeeze()
-
-            critic_loss = F.mse_loss(q, td_expectation)
-            self.optimC.zero_grad()
-            critic_loss.backward()
-            if self.grad_clip:
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
-            self.optimC.step()
-
-            # Actor (maximize Q(s, pi(s)) -> minimize -Q)
-            a_pred = self._scale_to_bounds(self.actor(o1))
-            actor_loss = -self.critic(o1, a_pred).mean()
-            self.optimA.zero_grad()
-            actor_loss.backward()
-            if self.grad_clip:
-                nn.utils.clip_grad_norm_((self.actor.parameters()), self.grad_clip)
-            self.optimA.step()
-
-            # Targets
-            soft_update(self.actor_targ, self.actor, self.tau)
-            soft_update(self.critic_targ, self.critic, self.tau)
-
-
-
-#
 # class DDPGAgent_EUT(DDPGAgent):
 #     """
 #     Rational (Expected unitlity) agent that computes the expected utility over a distribution of rewards from dynamics models.

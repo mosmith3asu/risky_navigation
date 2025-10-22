@@ -72,7 +72,7 @@ class Belief_FetchRobotMDP_Compiled:
     """
     def __init__(self,
                  n_samples=50,
-                 b_min_lin_vel=(0.0, 1e-6),
+                 b_min_lin_vel=(-0.25, 1e-6),
                  b_max_lin_vel=(1.0, 1.0),
                  b_max_lin_acc=(0.5, 0.2),
                  b_max_rot_vel=(math.pi/2.0, math.pi/6.0)):
@@ -133,6 +133,7 @@ class Belief_FetchRobotMDP_Compiled:
             else:
                 # Gaussian samples
                 self.samples[k, :] = np.random.normal(mu, std, n)
+
                 # Multiply in pdfs
                 p_k = normal_pdf_vec(self.samples[k, :], mu, std)
                 for i in range(n):
@@ -158,6 +159,8 @@ class Belief_FetchRobotMDP_Compiled:
         # self.max_lin_acc  = np.max(self.samples[MAX_LIN_ACC, :],0)
         # self.max_rot_vel  = np.max(self.samples[MAX_ROT_VEL, :],0)
 
+
+        assert np.all(p <= 1.0)
         self.robot_prob = p
 
     # ----------------------------------------------

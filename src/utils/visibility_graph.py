@@ -12,6 +12,12 @@ class VisibilityGraph:
     """A class to build a visibility graph for the continuous navigation environment."""
 
     def __init__(self, goal, obstacles, bounds, resolution=(20, 20),cached=True):
+        if isinstance(resolution, int):
+            dx = (bounds[1][0] - bounds[0][0])
+            dy = (bounds[1][1] - bounds[0][1])
+            dmax = max(dx, dy)
+            resolution = (int(resolution * (dx / dmax)), int(resolution * (dy / dmax)))
+
         if resolution[0]*resolution[1] < 20*20:
             print(f"Warning: visibility graph resolution {resolution} may be low; "
                   f"consider increasing to at least 400 elements (e.g., 20x20) for better accuracy." ,file=sys.stderr)
@@ -43,8 +49,8 @@ class VisibilityGraph:
         print('\t| finished.')
 
     def closest_idx(self, x, y):
-        if self.is_compiled:
-            return self._compiled_funs.closest_idx(x, y)
+        # if self.is_compiled:
+        #     return self._compiled_funs.closest_idx(x, y)
 
         dx_grid = self.grid[:, :, 0] + self.invalid_offset - x
         dy_grid = self.grid[:, :, 1] + self.invalid_offset - y

@@ -1,5 +1,5 @@
 from learning.DDPG.ddpg_agent import DDPGAgent,DDPGAgentVec
-from src.env.continous_nav_env import build_sync_vector_env, ContinuousNavigationEnvBase
+from src.env.continous_nav_env import build_sync_vector_env, ContinuousNavigationEnvBase, ContinuousNavigationEnvVec
 from src.env.layouts import read_layout_dict
 
 if __name__ == '__main__':
@@ -11,7 +11,8 @@ if __name__ == '__main__':
 
 
     layout_dict = read_layout_dict(LAYOUT)
-    env = ContinuousNavigationEnvBase(vgraph_resolution=(20, 20),**layout_dict)
+    env = ContinuousNavigationEnvBase(vgraph_resolution=(20,20),**layout_dict)
+
 
     agent_config = {
         'actor_lr': 1e-4,

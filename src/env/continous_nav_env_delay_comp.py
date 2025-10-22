@@ -1,18 +1,21 @@
+import os
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
-from src.utils.visibility_graph import VisibilityGraph
-from src.env.layouts import read_layout_dict
+from matplotlib import transforms as mtransforms
+import matplotlib.image as mpimg
 from gymnasium import spaces
 from abc import ABC, abstractmethod
 from collections import deque
 import math
 import warnings
+
+from src.utils.visibility_graph import VisibilityGraph
+from src.env.layouts import read_layout_dict
 from env.mdp import Compiled_LidarFun, Belief_FetchRobotMDP_Compiled
 from utils.file_management import get_project_root
-import os
 
-from matplotlib import transforms as mtransforms
-import matplotlib.image as mpimg
+
 
 
 #################################################################################
@@ -35,7 +38,7 @@ class Delayed_LidarState:
 
         if 'dynamics_belief' in kwargs.keys() is None:
             warnings.warn("dynamics_belief not provided to Delayed_LidarState. Using default belief.")
-        dynamics_belief = kwargs.pop('dynamics_belief', None)
+        dynamics_belief = kwargs.pop('dynamics_belief', {})
 
 
         # self.robot = make_belief_fetchrobot_mdp(**dynamics_belief) # robot dynamics model with uncertainty in parameters
@@ -68,7 +71,6 @@ class Delayed_LidarState:
 
         # Previous Action Features
         self.action_state_dim = 2 * delay_steps  # ax,ay history
-        self.action_hist_state_dim = n_rays
         for i in range(self._delay_steps):
             self._add_feature(f'jx{i}', bounds=[-1, 1])
             self._add_feature(f'jy{i}', bounds=[-1, 1])
@@ -96,6 +98,13 @@ class Delayed_LidarState:
         self._action_buffer = deque(maxlen=self._delay_steps)       # buffer of previous action samples [delay steps x 2]
         self._robot_state_buffer = deque(maxlen=self._delay_steps)  # buffer of previous robot state samples [delay steps x N x 4]
         self._cached_observation = None
+
+        self._rand_state_buffer = deque(maxlen=1000)
+
+        self._obs_space_dim =   self.robot_state_dim + \
+                                self.action_state_dim + \
+                                self.dist_state_dim + \
+                                self.lidar_state_dim
 
 
     ###################################################################################################
@@ -149,6 +158,7 @@ class Delayed_LidarState:
                                      goal_heading = δGhat_tt,
                                      lidar_dists = Lhat_tt
                                      )
+        assert shat_tt.shape[1]== self._obs_space_dim, 'Incorrect state dim'
 
         # Step true state (X_t)
         X_t = self.get_curr_robot_state()                               # resample robot dynamics
@@ -161,7 +171,7 @@ class Delayed_LidarState:
                                   goal_heading=δG_tt,
                                   lidar_dists=L_tt
                                   )
-
+        assert s_tt.shape[1] == self._obs_space_dim, 'Incorrect state dim'
 
         self._true_robot_state = X_tt.copy().reshape(1,self.robot_state_dim)                 # update true robot state
         self._true_dist2goal_state = np.hstack([dG_tt,δG_tt]).reshape(1,self.dist_state_dim) # update true distance to goal state
@@ -169,20 +179,111 @@ class Delayed_LidarState:
         self.put_buffer(X_t, action)  # put new true state and action in buffer
         return s_tt, shat_tt
 
-    def reset(self, is_rand=False):
+    def reset(self, is_rand=False, rand_buffer=False, rand_action_gen=None):
         self._cached_observation = None
-        self._true_robot_state = self._X0.copy()  # true robot state (not delayed)
-        if is_rand:  self._true_robot_state = self._get_rand_robot_state()
+        self._true_robot_state = None
+
+        if is_rand:
+            # get previous terminal state from buffer
+            if rand_buffer and len(self._rand_state_buffer) > 0:
+                robot_state, rand_actions = self._get_rand_buffer_state()
+
+            # Get delayed state with random ou actions
+            elif rand_action_gen is not None:
+                robot_state, rand_actions = self._get_rand_action_state(rand_action_gen)
+
+            else: # sample completely new random state with wait actions
+                robot_state = self._get_rand_wait_state()
+                rand_actions = (0,0)
+
+        # Start in starting state with buffer full of wait actions
+        else:
+            robot_state = self._X0.copy()  # true robot state (not delayed)
+            rand_actions = (0, 0)
+
+        robot_state = robot_state.reshape(1,4)
         self.clear_buffer()
-        self.fill_buffer()
+        self.fill_buffer(action=rand_actions, robot_state=robot_state)
+        self._true_robot_state = robot_state
+        assert self.is_full, "Delay buffer not full after reset()"
+        assert self._true_robot_state is not None, "True robot state not set after reset()"
+
+    def _get_rand_buffer_state(self):
+        raise NotImplementedError("Random buffer state retrieval is deprecated.")
+        # i = np.random.randint(0, len(self._rand_state_buffer))
+        # data = self._rand_state_buffer[i]
+        # observation = data['observation']
+        # del self._rand_state_buffer[i]
+        #
+        # self._true_robot_state = None
+        # robot_state = observation[:, :4]
+        # actions = [(observation[:, getattr(self, f'ijx{n}')],
+        #             observation[:, getattr(self, f'ijy{n}')])
+        #            for n in range(self._delay_steps)
+        #            ]
+        # return robot_state, actions
+
+    def _get_rand_action_state(self, rand_action_gen):
+        rand_actions = []
+        for _ in range(self._delay_steps):
+            a = rand_action_gen(increment_decay = False)
+            if isinstance(a, torch.Tensor):
+                a = a.cpu().numpy()
+            rand_actions.append(a)
+
+        robot_state = self._get_rand_wait_state()
+        return robot_state, rand_actions
+
+        # self.clear_buffer()
+        # true_state = self.fill_buffer(action=rand_actions, robot_state=robot_state)
+        # self._true_robot_state = true_state
+
+    def _get_rand_wait_state(self, heading_noise= np.pi / 8):
+        # sample new random state
+        # x,y,v,θ = self._true_robot_state
+
+        attempt = 0
+        for _ in range(50):
+            attempt += 1
+            _x = np.random.uniform(self.bounds[0][0], self.bounds[1][0])
+            _y = np.random.uniform(self.bounds[0][1], self.bounds[1][1])
+            _Xt = np.array([_x, _y, 0, 0], dtype=np.float32)[np.newaxis, :]
+
+            if self.robot_state_validator is None or \
+                    not self.robot_state_validator(_Xt):
+                x, y = _x, _y
+                break
+
+        if attempt > 49:
+            warnings.warn("Failed to find a valid random X Y after 50 attempts. Using last standard.")
+            x, y, v, θ = self._X0.copy()
+        else:
+
+            v = np.random.uniform(0, self.robot.true_max_lin_vel)  # random initial velocity
+            _, δGoal = self.f_dist2goal(np.array([x, y, 0, 0], dtype=np.float32)[np.newaxis, :])
+            θ = δGoal[0] + np.random.uniform(-heading_noise, heading_noise)
+
+        return np.array([x, y, v, θ], dtype=np.float32).reshape(1, -1)
 
     ###################################################################################################
     # State/delay handler methods #####################################################################
-    def decompose_state(self,S):
+    def decompose_state(self,S, as_dict=False):
         X = S[0:4]; i =4
         ahist = S[i:i+self.action_state_dim];i += self.action_state_dim
-        goal_dist = S[i:i+self.dist_state_dim];i += self.dist_state_dim
+        goal_dist,goal_heading = S[i:i+self.dist_state_dim];i += self.dist_state_dim
         lidar_dists = S[i:i + self.lidar_state_dim];i += self.lidar_state_dim
+
+        if as_dict:
+            return {
+                'X': X,
+                'robot_state': X,
+                'ahist': ahist,
+                'dist2goal': np.array([goal_dist, goal_heading]),
+                'goal_dist': goal_dist,
+                'gaol_heading': goal_heading,
+                'lidar_dists': lidar_dists
+            }
+
         return X,ahist,goal_dist,lidar_dists
 
     def compose_state(self,X, ahist, goal_dist, goal_heading, lidar_dists):
@@ -199,49 +300,52 @@ class Delayed_LidarState:
 
     def fill_buffer(self, action=(0.0, 0.0), robot_state=None):
         """ Fill the delay buffers with uniform values (e.g., waiting at beginning). """
+
         if robot_state is None:
             robot_state = self._true_robot_state.copy().reshape(1,4)
             # robot_state = robot_state.repeat(self.n_samples, axis=0)
-        action = np.array(action, dtype=np.float32)
-        for _ in range(self._delay_steps +1):
-            self.put_buffer(robot_state, action)
+
+
+        action = np.array(action, dtype=np.float32).reshape(-1,2)
+        n_action = action.shape[0]
+
+        if n_action ==1: # single action given (e.g., wait)
+            for _ in range(self._delay_steps +1):
+                self.put_buffer(robot_state, action[0])
+
+        elif n_action == self._delay_steps: # series of actions given
+            Xt = robot_state.copy().reshape(1,4)
+            for a in action:
+                # print(f'Xt:{Xt} \t A:{a}')
+                self.put_buffer(Xt, a)
+                Xt = self.robot.step_true(Xt, a, self.dt).reshape(1,4)
+            return Xt # returns true robot state
+        else:
+            raise ValueError(f"action shape {action.shape} not compatible with delay steps {self._delay_steps}")
+
         assert self.is_full, "Delay buffer not full after fill_buffer()"
+        return None
 
     def put_buffer(self,robot_state,action):
-        assert self.is_valid_robot_state(robot_state,stype='single'), f"robot_state shape {robot_state.shape} does not match expected {(4,)}"
+        assert self.is_valid_robot_state(robot_state,stype='single'), f"robot_state shape {robot_state.shape} does not match expected (nx4)"
         assert action.shape == (2,), f"action shape {action.shape} does not match expected {(2,)}"
         self._robot_state_buffer.append(robot_state)
         self._action_buffer.append(action)
 
-    def _get_rand_robot_state(self):
-        x,y,v,θ = self._true_robot_state
 
-        attempt = 0
+    def add_random_robot_state(self,observation):
+        # assert true_state.shape[0] == 1, f"Only single state (1xn) can be added to random buffer. {true_state.shape[0]} was given"
+        assert observation.shape[0] == 1, f"Only single observation (1xn) can be added to random buffer. {observation.shape[0]} was given"
 
-
-        for _ in range(50):
-            attempt += 1
-            _x = np.random.uniform(self.bounds[0][0], self.bounds[1][0])
-            _y = np.random.uniform(self.bounds[0][1], self.bounds[1][1])
-            _Xt = np.array([_x,_y,0,0],dtype=np.float32)[np.newaxis,:]
-
-            if self.robot_state_validator is None or \
-                    not self.robot_state_validator(_Xt):
-                x, y = _x, _y
-                break
-
-        if attempt > 49:
-            warnings.warn("Failed to find a valid random X Y after 50 attempts. Using last standard.")
-        else:
-
-            v = np.random.uniform(0, self.robot.true_max_lin_vel)  # random initial velocity
-            _, δGoal = self.f_dist2goal(np.array([x, y, 0, 0], dtype=np.float32)[np.newaxis, :])
-            θ = δGoal[0] + np.random.uniform(-np.pi / 4, np.pi / 4)
-
-        return np.array([x, y, v, θ],dtype=np.float32).reshape(1,-1)
+        data = {
+            # 'true_state': true_state.copy(),
+            'observation': observation.copy()
+                }
+        self._rand_state_buffer.append(data)
 
     def infer_curr_robot_state(self,robot_state,actions):
-        assert self.is_valid_robot_state(robot_state,stype='single'), f"robot_state shape {robot_state.shape} does not match expected {(4,)}"
+        assert self.is_valid_robot_state(robot_state,stype='single'), \
+            f"robot_state shape {robot_state.shape} does not match expected (n,4)"
         Xt = np.repeat(robot_state, self.n_samples, axis=0)
         for action in actions:
             Xt = self.robot.step(Xt, action, self.dt)
@@ -269,13 +373,12 @@ class Delayed_LidarState:
         ).flatten()
         return self._cached_observation.copy()
 
-
     @property
     def delayed_robot_state(self):
-        return self._robot_state_buffer[0].copy()
+        return self._robot_state_buffer[0].copy() if self._delay_steps >0 else self._true_robot_state.copy()
     @property
     def action_history(self):
-        return np.array(self._action_buffer)
+        return np.array(self._action_buffer) if self._delay_steps >0 else np.array([])
 
     def get_curr_robot_state(self):
         return self._true_robot_state.copy().reshape(1, -1)
@@ -333,14 +436,22 @@ class Delayed_LidarState:
 # Environment Classes ###########################################################
 #################################################################################
 class EnvBase(ABC):
-    def __init__(self,**kwargs):
+    @classmethod
+    def from_layout(cls, layout_name, *args, **kwargs):
+
+        layout_dict = read_layout_dict(layout_name)
+        kwargs.update(layout_dict)
+        return cls(*args, **kwargs)
+
+    def __init__(self,max_steps,dt, **kwargs):
+        self.dt = dt
+        self.max_steps = max_steps
+
         self.fig = None
         self.ax = None
         self.bounds = None
         self.goal = None
         self.obstacles = None
-        self.dt = None
-        self.max_steps = None
         self.state = None
 
 
@@ -349,12 +460,32 @@ class EnvBase(ABC):
         self.car_radius         = kwargs.get('car_radius'    , 0.65)  # meters
 
         self.reward_goal        = kwargs.get('reward_goal'   , 10.0)
-        self.reward_collide     = kwargs.get('reward_collide', -20.0)  # penalty for collision
-        self.reward_step        = kwargs.get('reward_step'   , -0.1)  # penalty for being slow
-        self.reward_dist2goal   = kwargs.get('reward_dist',
-                                           0.1)  # 20/max_steps)    # maximum possible reward being close to goal
-        assert self.reward_dist2goal <= -1 * self.reward_step, 'Reward for distance to goal should be less than or equal to timecost' \
-                                                               ' to make completing task faster aslways more optimal. '
+        self.reward_collide     = kwargs.get('reward_collide', -20.0) # penalty for collision
+        self.reward_step      = kwargs.get('reward_step'   , -0.1)  # penalty for being slow
+        self.reward_dist2goal = kwargs.get('reward_dist'   , 0.1) # maximum possible reward being close to goal
+
+        # self.reward_goal        = kwargs.get('reward_goal'   , 10.0)
+        # self.reward_collide     = kwargs.get('reward_collide', -30.0) # penalty for collision
+        # self.reward_step      = kwargs.get('reward_step'   , -0.05)  # penalty for being slow
+        # self.reward_dist2goal = kwargs.get('reward_dist'   , 0.1) # maximum possible reward being close to goal
+
+        # self.reward_goal = kwargs.get('reward_goal', 10.0)
+        # self.reward_collide = kwargs.get('reward_collide', -60.0)  # penalty for collision
+        # self.reward_step = kwargs.get('reward_step', -0.075)  # penalty for being slow
+        # self.reward_dist2goal = kwargs.get('reward_dist', 0.1)  # maximum possible reward being close to goal
+
+
+
+        # assert abs(self.reward_dist2goal/2)\
+        #        <= abs(self.reward_step), f'Waiting Always Worse: Total horizon dist2goal reward/2 |{abs(self.reward_dist2goal/2)}|' \
+        #                                  f' should be less than or equal to timecost {abs(self.reward_step)}' \
+        #                                  ' to make completing task faster always more optimal. '
+        # assert abs(self.reward_step*self.max_steps)\
+        #        <= abs(self.reward_collide), f'Crashing Always Worse than Slow: Total horizon timestep cost |{self.reward_step*self.max_steps}| ' \
+        #                                     f'should be less than or equal to collision penalty |{self.reward_collide}|'
+        # assert abs(self.reward_dist2goal/2*self.max_steps) \
+        #        <= abs(self.reward_collide), f'Crashing Always Worse than Close: Total horizon dist2goal reward/2  |{abs(self.reward_dist2goal/2*self.max_steps)}|' \
+        #                                     f' should be less than or equal to collision penalty {abs(self.reward_collide)}'
 
     @abstractmethod
     def step(self, *args, **kwargs):
@@ -622,15 +753,6 @@ class EnvBase(ABC):
 
 
 class ContinousNavEnv(EnvBase):
-
-    @classmethod
-    def from_layout(cls, layout_name, *args, **kwargs):
-
-        layout_dict = read_layout_dict(layout_name)
-        kwargs.update(layout_dict)
-        return cls(*args, **kwargs)
-
-
     def __init__(self,
                  goal              = (5.0 , 5.0),
                  bounds            = ((0.0, 0.0), (10.0, 10.0)),
@@ -644,7 +766,7 @@ class ContinousNavEnv(EnvBase):
                  vgraph_resolution = 30,#(30, 30),
                  **kwargs
                  ):
-        super().__init__(**kwargs) # contains default vals that do not need to be changed
+        super().__init__(max_steps, dt, **kwargs) # contains default vals that do not need to be changed
 
         start_pos = np.array(start_pos, dtype=np.float32)
         start_velocity = np.array(start_velocity, dtype=np.float32)
@@ -657,13 +779,11 @@ class ContinousNavEnv(EnvBase):
         self.goal      = tuple(goal)
         self.obstacles = self.format_obstacles(obstacles)
         self.obstacles = self.create_boarder_obstacles(self.obstacles)  # add borders to the environment
-        self.dt        = dt
-        self.max_steps = max_steps
 
         # Action parameters ------------------------------------------------------------------------------------------
         self.action_bounds = {}
-        self.action_bounds['jx'] = [-1, 1]  # normalized joystick commands (steering)
-        self.action_bounds['jy'] = [-1, 1]  # normalized joystick commands (velocity)
+        self.action_bounds['jx'] = kwargs.pop('action_bounds_x',[-1, 1])  # normalized joystick commands (steering)
+        self.action_bounds['jy'] = kwargs.pop('action_bounds_y',[-1, 1])  # normalized joystick commands (velocity)
 
         low_act = np.array([bound[0] for bound in self.action_bounds.values()], dtype=np.float32)
         high_act = np.array([bound[1] for bound in self.action_bounds.values()], dtype=np.float32)
@@ -673,12 +793,7 @@ class ContinousNavEnv(EnvBase):
         self.steps = 0
         self.done = False  # flag to indicate if the episode is done
 
-        if isinstance(vgraph_resolution, int):
-            dx = (self.bounds[1][0] - self.bounds[0][0])
-            dy = (self.bounds[1][1] - self.bounds[0][1])
-            dmax = max(dx, dy)
-            vgraph_resolution = (int(vgraph_resolution * (dx/dmax)),int(vgraph_resolution * (dy/dmax)))
-
+        self.vgraph_resolution = vgraph_resolution
         vgraph = VisibilityGraph(self.goal, self.obstacles, self.bounds, resolution=vgraph_resolution )
         self.max_dist = vgraph.max_dist
         f_dist2goal = vgraph.get_compiled_funs()
@@ -686,7 +801,7 @@ class ContinousNavEnv(EnvBase):
         self.state = Delayed_LidarState(X0, f_dist2goal, f_lidar, delay_steps, dt,
                                         bounds=self.bounds,
                                         robot_state_validator = self._check_collision,
-                                        dynamics_belief = kwargs.pop('dynamics_belief', None),
+                                        dynamics_belief = kwargs.pop('dynamics_belief', {}),
                                         n_samples = kwargs.pop('n_samples', 50),
                                         **kwargs)
 
@@ -704,19 +819,6 @@ class ContinousNavEnv(EnvBase):
                 raise ValueError(f"Unknown kwarg {key} in ContinousNavEnv.")
 
         # Print configuration summary
-        print(f"ContinousNavEnv initialized with layout: {self.layout}")
-        s = "\nBelief_FetchRobotMDP_Compiled:"
-        s += f"\n  n_samples: {self.state.robot.n_samples}"
-        s += f"\n  belief_mu: {self.state.robot.belief_mu}"
-        s += f"\n  belief_std: {self.state.robot.belief_std}"
-        s += f"\n  true parameters:"
-        s += f"\n    true_min_lin_vel: {self.state.robot.true_min_lin_vel}"
-        s += f"\n    true_max_lin_vel: {self.state.robot.true_max_lin_vel}"
-        s += f"\n    true_max_lin_acc: {self.state.robot.true_max_lin_acc}"
-        s += f"\n    true_max_rot_vel: {self.state.robot.true_max_rot_vel}"
-        s += f"\n"
-        print(s)
-
 
     def step(self, action, true_done = False):
         self.steps += 1
@@ -747,11 +849,19 @@ class ContinousNavEnv(EnvBase):
         _done = self.done if true_done else dones
         return shat_tt, rewards, _done, master_info
 
-    def reset(self,p_rand_state=0):
+    def reset(self,p_rand_state=0, **kwargs):
         self.steps = 0
         is_rand = (np.random.rand() < p_rand_state)
-        self.state.reset(is_rand = is_rand)
-        col_dones = self._check_collision(self.state._true_robot_state.reshape(1,-1))
+        for attempt in range(kwargs.get('rand_attempts',50)):
+            self.state.reset(is_rand = is_rand, **kwargs)
+            col_dones = self._check_collision(self.state._true_robot_state.reshape(1,-1))
+            if not np.any(col_dones):
+                break
+
+        if np.any(col_dones):
+            self.state.reset()
+            col_dones = self._check_collision(self.state._true_robot_state.reshape(1, -1))
+
         assert not np.any(col_dones), 'invalid reset state (starts in collision)'
 
     def _resolve_action(self, action):
@@ -866,11 +976,42 @@ class ContinousNavEnv(EnvBase):
     def observation(self):
         return self.state.observation
 
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        # print(f"ContinousNavEnv initialized with layout: {self.layout}")
+
+        s = ''
+        s += f"\nContinousNavEnv:"
+        s += f"\n\t| layout: {self.layout}"
+        s += f"\n\t| goal: {self.goal}"
+        s += f"\n\t| dt: {self.dt}"
+        s += f"\n\t| max_steps: {self.max_steps}"
+        s += f"\n\t| action_bounds: {self.action_bounds}"
+        s += f"\n\t| delay_steps: {self.delay_steps}"
+        s += f"\n\t| n_samples: {self.n_samples}"
+        s += f"\n\t| vgraph_resolution: {self.vgraph_resolution}"
+
+
+        s += "\n\nBelief_FetchRobotMDP_Compiled:"
+        s += f"\n\t| n_samples: {self.state.robot.n_samples}"
+        # s += f"\n\t| belief_mu: {self.state.robot.belief_mu}"
+        # s += f"\n\t| belief_std: {self.state.robot.belief_std}"
+        s += f"\n\t| belief:"
+        s += f"\n\t|\t| min_lin_vel: {self.state.robot.true_min_lin_vel} + {self.state.robot.belief_std[0]}"
+        s += f"\n\t|\t| max_lin_vel: {self.state.robot.true_max_lin_vel} + {self.state.robot.belief_std[1]}"
+        s += f"\n\t|\t| max_lin_acc: {self.state.robot.true_max_lin_acc} + {self.state.robot.belief_std[2]}"
+        s += f"\n\t|\t| max_rot_vel: {self.state.robot.true_max_rot_vel} + {self.state.robot.belief_std[3]}"
+        s += f"\n"
+        return s
+
 def main_vec():
     from utils.joystick import VirtualJoystick
     import time
 
     layout =  'example2'
+    P_RAND_STATE = 1
 
     env = ContinousNavEnv.from_layout(layout)
 
@@ -881,15 +1022,15 @@ def main_vec():
     # plt.show(block=True)
 
     fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    env.render_reward_heatmap(ax=axs[0], r_collision=False, r_dist2goal=True ,r_goal=False,draw_obstacles=True,show_colorbar=True, block=False)
-    env.render_reward_heatmap(ax=axs[1], r_collision=False, r_dist2goal=True ,r_goal=True,draw_obstacles=True,show_colorbar=True, block=False)
-    env.render_reward_heatmap(ax=axs[2], r_collision=True, r_dist2goal=True ,r_goal=True,draw_obstacles=False,show_colorbar=True, block=True)
+    # env.render_reward_heatmap(ax=axs[0], r_collision=False, r_dist2goal=True ,r_goal=False,draw_obstacles=True,show_colorbar=True, block=False)
+    # env.render_reward_heatmap(ax=axs[1], r_collision=False, r_dist2goal=True ,r_goal=True,draw_obstacles=True,show_colorbar=True, block=False)
+    # env.render_reward_heatmap(ax=axs[2], r_collision=True, r_dist2goal=True ,r_goal=True,draw_obstacles=False,show_colorbar=True, block=True)
 
 
     joystick = VirtualJoystick(ax=axs[0], deadzone=0.05, smoothing=0.35, spring=True)
     axs[-1].set_title("Virtual Joystick Input")
 
-    env.reset()
+    env.reset(p_rand_state=P_RAND_STATE)
 
 
     total_reward = 0.0
@@ -914,7 +1055,7 @@ def main_vec():
             pass
 
         if info['true_done']:
-            obs = env.reset()
+            obs = env.reset(p_rand_state=P_RAND_STATE)
 
 
 
