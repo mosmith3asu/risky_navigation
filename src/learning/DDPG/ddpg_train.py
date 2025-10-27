@@ -7,9 +7,6 @@ if __name__ == '__main__':
     PARALLEL_ENVS = 5
     LAYOUT = 'example2'
 
-
-
-
     layout_dict = read_layout_dict(LAYOUT)
     env = ContinuousNavigationEnvBase(vgraph_resolution=(20,20),**layout_dict)
 

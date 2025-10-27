@@ -38,11 +38,21 @@ class Delayed_LidarState:
 
         if 'dynamics_belief' in kwargs.keys() is None:
             warnings.warn("dynamics_belief not provided to Delayed_LidarState. Using default belief.")
-        dynamics_belief = kwargs.pop('dynamics_belief', {})
+        dynamics_belief = kwargs.pop('dynamics_belief', {
+            'b_min_lin_vel': (0.0, 1e-6),
+            'b_max_lin_vel': (1.0, 0.5),
+            'b_max_lin_acc': (0.5, 0.2),
+            'b_max_rot_vel': (math.pi / 2.0, math.pi / 6.0)
+        })
 
 
         # self.robot = make_belief_fetchrobot_mdp(**dynamics_belief) # robot dynamics model with uncertainty in parameters
 
+
+        small_sigmas = [val[0] < 1 / np.sqrt(2 * np.pi) for val in dynamics_belief.values()]
+        if np.all(small_sigmas):
+            warnings.warn("All dynamics belief stddevs are very small (< 1/sqrt(2pi)). "
+                          "Assuming no variation in dynamics for numerical stability")
 
         self.robot = Belief_FetchRobotMDP_Compiled(
             n_samples       = n_samples,
@@ -459,33 +469,36 @@ class EnvBase(ABC):
         self.goal_radius        = kwargs.get('goal_radius'   , 0.25)  # meters
         self.car_radius         = kwargs.get('car_radius'    , 0.65)  # meters
 
-        self.reward_goal        = kwargs.get('reward_goal'   , 10.0)
-        self.reward_collide     = kwargs.get('reward_collide', -20.0) # penalty for collision
-        self.reward_step      = kwargs.get('reward_step'   , -0.1)  # penalty for being slow
-        self.reward_dist2goal = kwargs.get('reward_dist'   , 0.1) # maximum possible reward being close to goal
 
-        # self.reward_goal        = kwargs.get('reward_goal'   , 10.0)
-        # self.reward_collide     = kwargs.get('reward_collide', -30.0) # penalty for collision
-        # self.reward_step      = kwargs.get('reward_step'   , -0.05)  # penalty for being slow
-        # self.reward_dist2goal = kwargs.get('reward_dist'   , 0.1) # maximum possible reward being close to goal
+        # self.reward_goal        = kwargs.get('reward_goal', 10.0)
+        # self.reward_collide     = kwargs.get('reward_collide', -20.0)  # penalty for collision
+        # self.reward_step        = kwargs.get('reward_step', -0.1)  # penalty for being slow
+        # self.reward_dist2goal   = kwargs.get('reward_dist', 0.2)  # maximum possible reward being close to goal
 
-        # self.reward_goal = kwargs.get('reward_goal', 10.0)
-        # self.reward_collide = kwargs.get('reward_collide', -60.0)  # penalty for collision
-        # self.reward_step = kwargs.get('reward_step', -0.075)  # penalty for being slow
-        # self.reward_dist2goal = kwargs.get('reward_dist', 0.1)  # maximum possible reward being close to goal
+        self.reward_goal = kwargs.get('reward_goal', 20.0)
+        self.reward_collide = kwargs.get('reward_collide', -50.0)  # penalty for collision
+        self.reward_step = kwargs.get('reward_step', -0.1)  # penalty for being slow
+        self.reward_dist2goal = kwargs.get('reward_dist', 0.15)  # maximum possible reward being close to goal
 
 
 
-        # assert abs(self.reward_dist2goal/2)\
-        #        <= abs(self.reward_step), f'Waiting Always Worse: Total horizon dist2goal reward/2 |{abs(self.reward_dist2goal/2)}|' \
-        #                                  f' should be less than or equal to timecost {abs(self.reward_step)}' \
-        #                                  ' to make completing task faster always more optimal. '
-        # assert abs(self.reward_step*self.max_steps)\
-        #        <= abs(self.reward_collide), f'Crashing Always Worse than Slow: Total horizon timestep cost |{self.reward_step*self.max_steps}| ' \
-        #                                     f'should be less than or equal to collision penalty |{self.reward_collide}|'
-        # assert abs(self.reward_dist2goal/2*self.max_steps) \
-        #        <= abs(self.reward_collide), f'Crashing Always Worse than Close: Total horizon dist2goal reward/2  |{abs(self.reward_dist2goal/2*self.max_steps)}|' \
-        #                                     f' should be less than or equal to collision penalty {abs(self.reward_collide)}'
+
+
+        # Reward Consistency Checks
+        gamma = 0.99
+        discounted = np.power(gamma, np.arange(self.max_steps))
+        # exp_cum_reward_dist2goal = np.sum(self.reward_dist2goal/2  * discounted)
+        exp_cum_reward_dist2goal = np.sum(self.reward_dist2goal  * discounted)
+        exp_cum_reward_step = np.sum(self.reward_step * discounted)
+
+
+        buff = 1
+        assert abs(exp_cum_reward_step) < abs(exp_cum_reward_dist2goal), f'Avoiding Timecost is Worse than Getting Closer: '
+        assert buff * abs(exp_cum_reward_step)< abs(self.reward_collide), f'Crashing Always Worse than Slow'
+        assert abs(exp_cum_reward_dist2goal) < abs(self.reward_collide), f'Crashing Always Worse than Close:'
+        assert abs(buff * exp_cum_reward_dist2goal + exp_cum_reward_step) < abs(self.reward_goal), f'Goal Always Better than Close:'
+
+
 
     @abstractmethod
     def step(self, *args, **kwargs):
@@ -805,6 +818,10 @@ class ContinousNavEnv(EnvBase):
                                         n_samples = kwargs.pop('n_samples', 50),
                                         **kwargs)
 
+        self.set_global_overrides(**kwargs) # set remaining uncaught params
+
+
+    def set_global_overrides(self, **kwargs):
         # Parse remaining kwargs and set attributes
         obj_list = [self, self.state, self.state.robot]
         for key, val in kwargs.items():
@@ -817,8 +834,6 @@ class ContinousNavEnv(EnvBase):
                     is_found = True
             if not is_found:
                 raise ValueError(f"Unknown kwarg {key} in ContinousNavEnv.")
-
-        # Print configuration summary
 
     def step(self, action, true_done = False):
         self.steps += 1
@@ -953,10 +968,10 @@ class ContinousNavEnv(EnvBase):
         info['rew_dist2goal'] = rew_dist2goal
         assert rew_dist2goal.shape == rewards.shape
 
-        rewards += rew_dist2goal  # progress towards goal reward
+        rewards += rew_dist2goal   # progress towards goal reward
         rewards += self.reward_step  # time cost
-        rewards += (info['reason'] == 'collision') * self.reward_collide
-        rewards += (info['reason'] == 'goal_reached') * self.reward_goal
+        rewards += (info['reason'] == 'collision')      * self.reward_collide
+        rewards += (info['reason'] == 'goal_reached')   * self.reward_goal
 
         return rewards, info
 

@@ -3,6 +3,7 @@ from numba import njit, float64, int64, boolean
 from numba.experimental import jitclass
 import math
 import warnings
+# from scipy.stats import norm
 
 # Parameter indices (for readability)
 MIN_LIN_VEL = 0
@@ -13,14 +14,16 @@ MAX_ROT_VEL = 3
 # -----------------------------
 # Helper: normal pdf (JIT-safe)
 # -----------------------------
+
 @njit
 def normal_pdf(x, mu, std):
-    if std == 0.0:
-        # treat degenerate case as probability 1 (matches original code’s intent)
-        return 1.0
-    inv = 1.0 / (std * math.sqrt(2.0 * math.pi))
+    """pdf of normal distribution at x with mean mu and std dev std. Handles small std safely."""
+    assert std > 0.0, "std must be positive in normal_pdf"
     z = (x - mu) / std
-    return inv * math.exp(-0.5 * z * z)
+    denom = std * np.sqrt(2 * np.pi)
+    p = np.exp(- 0.5 * z ** 2) / denom
+    return p
+
 
 @njit
 def normal_pdf_vec(xs, mu, std):
@@ -124,10 +127,13 @@ class Belief_FetchRobotMDP_Compiled:
         for k in range(4):
             mu = self.belief_mu[k]
             std = self.belief_std[k]
-
             if std == 0.0:
+            # if std < 1 / np.sqrt(2 * np.pi):
                 # Deterministic
                 self.samples[k, :] = mu
+                p_k = normal_pdf_vec(self.samples[k, :], mu, 1e-6)
+                for i in range(n):
+                    p[i] *= p_k[i]
                 # probability contribution = 1 (matches original)
                 # p *= 1  (no-op)
             else:
@@ -160,7 +166,7 @@ class Belief_FetchRobotMDP_Compiled:
         # self.max_rot_vel  = np.max(self.samples[MAX_ROT_VEL, :],0)
 
 
-        assert np.all(p <= 1.0)
+        # assert np.all(p <= 1.0)
         self.robot_prob = p
 
     # ----------------------------------------------
@@ -347,7 +353,11 @@ class Compiled_LidarFun:
                 w, h = float(obs['width']), float(obs['height'])
                 min_t = get_ray2obstacle_dist_rect(min_t, x, y, δ, cx, cy, w, h)
 
-        assert np.isfinite(min_t), f"Ray does not intersect any obstacle x:{x} y:{y} δ:{δ}"
+        # assert np.isfinite(min_t), f"Ray does not intersect any obstacle x:{x} y:{y} δ:{δ}"
+
+        if not np.isfinite(min_t): # alread went out of bounds since env is fully enclosed
+            min_t = -1
+
         u = np.array([np.cos(δ), np.sin(δ)], dtype=np.float64)  # ray direction, |u|=1
         vec = (u * min_t).astype(np.float32)  # vector from (x,y) to intersection point
         return vec

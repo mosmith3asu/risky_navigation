@@ -2,6 +2,299 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import warnings
+
+from scipy.stats import norm
+from scipy.stats import multivariate_normal
+####################################################################
+### Risk-Sensitivity ###############################################
+####################################################################
+class CumulativeProspectTheory:
+    """
+    https://github.com/cvxgrp/cptopt/blob/master/cptopt/utility.py
+    """
+    def __init__(self):
+        pass
+
+    # Utility Functions ###########################
+    def u_plus(self,o, power=0.85):
+        return o ** power
+
+    def u_minus(self, o, power=0.85, loss_aversion=2):
+        return -loss_aversion * np.abs(o) ** power
+
+    def u(self,o, power=0.85, loss_aversion=2):
+        if o >= 0:
+            return self.u_plus(o, power)
+        else:
+            return self.u_minus(o, power, loss_aversion)
+
+    # Probability Weighting ###########################
+    def w(self,p,alpha,delta=0.75):
+        return np.exp(-alpha*(-np.log(p))**delta)
+    # CPT-Value Difference function ##########
+    def f(self,p, b, a, la, cc):
+        psi_R = self.w(p, a) if R - b > 0 else 1 - self.w(1 - p, a)
+        psi_S = self.w(1 - p, a) if S - b > 0 else 1 - self.w(p, a)
+        return self.u(self.R - b, cc, la) * psi_R + self.u(S - b, cc, la) * psi_S - self.u(T - b, cc, la)
+
+def quantile_expectation(
+        samples,
+        weight_fn=None,
+        axis=-1,
+        keepdims=False,
+        validate=False
+):
+    """
+    Quantile-based expectation from samples.
+
+    Computes  ∫_0^1 Q_X(u) d w(u)  using the empirical quantile function Q_X
+    (order statistics) and Riemann–Stieltjes sum:
+        E_w[X] ≈ Σ_{i=1}^n x_(i) * ( w(i/n) - w((i-1)/n) ),
+    where x_(i) are the sorted samples along `axis`.
+
+    Parameters
+    ----------
+    samples : array_like
+        Sample values. Can be 1D or ND; `axis` selects the sample dimension.
+    weight_fn : callable(u)->float, optional
+        Distortion/weighting function w(u) with w(0)=0, w(1)=1 and nondecreasing.
+        If None, uses identity w(u)=u (standard expectation).
+        Examples:
+            - identity: lambda u: u
+            - Prelec (risk-seeking/averse depending on α,β):
+                lambda u, α=0.7, β=1.0: np.exp(-β * (-np.log(np.clip(u,1e-12,1)))**α)
+            - Power: lambda u, γ=0.8: u**γ
+    axis : int
+        Axis containing the i.i.d. samples.
+    keepdims : bool
+        Whether to keep reduced dimensions.
+    validate : bool
+        If True, checks basic monotonicity and boundary conditions for w.
+
+    Returns
+    -------
+    ew : ndarray
+        Quantile-based expectation along `axis`. Shape is `samples` with
+        the sample axis removed unless `keepdims=True`.
+    """
+
+    device, dtype = None,None
+    is_torch = isinstance(samples,torch.Tensor)
+    if is_torch:
+        device, dtype = samples.device, samples.dtype
+        samples = samples.cpu().numpy()
+
+    x = np.asarray(samples)
+    # Move sample axis to the last for convenience
+    x = np.moveaxis(x, axis, -1)
+
+    # Drop NaNs if present
+    mask = ~np.isnan(x)
+
+    # If any NaNs, we’ll mask per-slice; otherwise fast path
+    if mask.all():
+        sorted_x = np.sort(x, axis=-1)
+        n = sorted_x.shape[-1]
+        if n == 0:
+            raise ValueError("No samples provided along the chosen axis.")
+        if weight_fn is None:
+            # E[X] = mean via quantile integral equals arithmetic mean
+            ew = sorted_x.mean(axis=-1, keepdims=keepdims)
+            return np.moveaxis(ew, -1, axis) if keepdims else ew
+        # Build grid u_i = i/n, i=0..n
+        u = np.linspace(0.0, 1.0, n + 1)
+        w = np.fromiter((weight_fn(ui) for ui in u), dtype=float, count=n + 1)
+        if validate:
+            if not (np.isclose(w[0], 0.0) and np.isclose(w[-1], 1.0)):
+                raise ValueError("weight_fn must satisfy w(0)=0 and w(1)=1.")
+            if np.any(np.diff(w) < -1e-12):
+                raise ValueError("weight_fn must be nondecreasing on [0,1].")
+        dw = np.diff(w)  # length n, nonnegative
+        # Weighted sum of order stats by increments of w
+        ew = np.sum(sorted_x * dw[..., None].swapaxes(0, -1)[0], axis=-1)
+        # Above swap is awkward; simpler:
+        # ew = np.tensordot(sorted_x, dw, axes=([-1],[0]))
+        ew = np.tensordot(sorted_x, dw, axes=([-1], [0]))
+        if keepdims:
+            ew = np.expand_dims(ew, axis=-1)
+        # return ew
+
+
+    else:
+        # Handle NaNs per slice by compacting
+        # Flatten leading dims, iterate last dim stacks
+        lead_shape = x.shape[:-1]
+        ew = np.empty(lead_shape, dtype=float)
+        it = np.nditer(np.zeros(lead_shape), flags=['multi_index'])
+
+        if weight_fn is None:
+            while not it.finished:
+                vals = x[it.multi_index]
+                vals = vals[~np.isnan(vals)]
+                if vals.size == 0:
+                    ew[it.multi_index] = np.nan
+                else:
+                    ew[it.multi_index] = vals.mean()
+                it.iternext()
+
+
+        else:
+            # Precompute nothing; evaluate w on each slice's n
+            while not it.finished:
+                vals = x[it.multi_index]
+                vals = vals[~np.isnan(vals)]
+                if vals.size == 0:
+                    ew[it.multi_index] = np.nan
+                else:
+                    vals.sort()
+                    n = vals.size
+                    u = np.linspace(0.0, 1.0, n + 1)
+                    w = np.fromiter((weight_fn(ui) for ui in u), dtype=float, count=n + 1)
+                    if validate:
+                        if not (np.isclose(w[0], 0.0) and np.isclose(w[-1], 1.0)):
+                            raise ValueError("weight_fn must satisfy w(0)=0 and w(1)=1.")
+                        if np.any(np.diff(w) < -1e-12):
+                            raise ValueError("weight_fn must be nondecreasing on [0,1].")
+                    dw = np.diff(w)
+                    ew[it.multi_index] = np.dot(vals, dw)
+                it.iternext()
+        if keepdims:
+            ew = np.expand_dims(ew, axis=-1)
+
+    if is_torch:
+        ew = torch.tensor(ew, device=device, dtype=dtype)
+
+    return ew
+def quantile_expectation2(X):
+    """Computes expected mean of distribution from only samples using quantile integration.
+    - Assumes evenly spaced samples ol
+
+    """
+    # raise NotImplementedError("Use pdf_expectation instead; quantile_expectation is deprecated.")
+    assert X.ndim == 1, "X must be 1D array of value samples"
+    #
+    X_sorted = np.sort(X, axis=-1)
+    n = X.shape[0]
+    Xi = X[:-1]
+    dX = X[1:] - Xi
+    exp = (1/n) * np.sum(X_sorted[:-1] + X_sorted[1:]) / 2.0
+    return exp
+
+# def quantile_expectation_torch_batch(X):
+#     assert X.ndim == 2, "X must be 1D array of value samples"
+#
+#     # Sort each batch individually along dim=1
+#     X_sort, sort_idx = torch.sort(X, dim=1)
+#
+#     X_sorted = np.sort(X, axis=-1)
+#
+#     exp = (1 / n) * np.sum(X_sorted[:-1] + X_sorted[1:]) / 2.0
+
+
+
+def pdf_expectation(X,pdf, normalize=True):
+    """Computes expected mean of distribution from samples and pdf weights using trapezoidal integration."""
+    isort =  np.argsort(X)
+    X_sort = X[isort]
+    pdf_sort = pdf[isort]
+    dx = X_sort[1:] - X_sort[:-1]
+
+    # Normalize pdf so that ∫ pdf dx = 1 over the uneven grid
+    if normalize:
+        pdf_sort /= np.trapz(pdf_sort, X_sort)
+
+    # Compute expected value E[X] = ∫ x * pdf(x) dx
+    exp = np.sum(0.5 * (X_sort[1:] + X_sort[:-1]) * pdf_sort[:-1] * dx)
+    return exp
+
+def pdf_expectation_torch_batch(X, pdf, normalize=True):
+    """
+    Batched expected value of a PDF over unevenly spaced X.
+
+    Args:
+        X   : (B, N) tensor of sample locations
+        pdf : (B, N) tensor of pdf values
+        normalize (bool): normalize pdf so ∫pdf dx = 1 for each batch
+
+    Returns:
+        exp_vals : (B,) tensor of expected values
+    """
+    if X.ndim != 2 or pdf.ndim != 2:
+        raise ValueError("X and pdf must both be 2D tensors (B, N).")
+    if X.shape != pdf.shape:
+        raise ValueError("X and pdf must have the same shape.")
+
+    B, N = X.shape
+    device, dtype = X.device, X.dtype
+
+    X = X.to(device=device, dtype=torch.float64)        # change to double percision
+    pdf = pdf.to(device=device, dtype=torch.float64)    # change to double percision
+
+
+    # Sort each batch individually along dim=1
+    X_sort, sort_idx = torch.sort(X, dim=1)
+    pdf_sort = torch.gather(pdf, 1, sort_idx)
+
+    # compute area intervals and normalize pdfs
+    dx = X_sort[:, 1:] - X_sort[:, :-1]
+    if normalize:
+        # Trapezoidal integral for normalization (batchwise)
+        area = torch.sum(0.5 * (pdf_sort[:, 1:] + pdf_sort[:, :-1]) * dx, dim=1, keepdim=True)
+        pdf_sort = pdf_sort / area
+
+    # Midpoint-style expectation across uneven grid
+    exp_vals = torch.sum(
+        0.5 * (X_sort[:, 1:] + X_sort[:, :-1]) * pdf_sort[:, :-1] * dx,
+        dim=1
+    )
+
+    # handle edge case where all samples are same reward (numerical instability)
+    uniform_dx_idxs = torch.where(torch.all(dx==0,dim=1))
+    for i in uniform_dx_idxs:
+        exp_vals[i] = X_sort[i,0]
+    # exp_vals[torch.all(dx==0,dim=1)] = X_sort[torch.all(dx==0,dim=1)] # handle edge case where all same reward
+
+    assert torch.all(torch.isfinite(exp_vals)), "Non-finite expected values computed."
+
+    return exp_vals.to(dtype=dtype)
+
+
+def test_risk_sensitivity():
+    np.random.seed(0)
+    # set scipy seed
+    n_samples = 50
+
+    # for mu,std in zip([-2.0, 0.0, 5.0, 0.5],[1.0,0.5,0.75,0.1]):
+    # for mu, std in zip([5.0, 1,0.0,  0.5,0.75, -2.0], [1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6]):
+    # for mu, std in zip([5.0, 1,  0.5,0.0, 0.5, -1.0, -5], [1e-6,1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6]):
+    for mu, std in zip([5.0, 1, 0.5, 0.0, 0.5, -1.0, -5],
+                       [1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6]):
+        X = np.random.normal(mu, std, size=n_samples)
+        pdf = norm.pdf(X, loc=mu, scale=std)
+        # pdf = np.clip(pdf,0,1)
+
+
+        # print(f"Analytical E[X]: {exp_analytical}")
+        print(f'\n\n mu = {mu} std ={std} ########################################')
+        quant_exp_err = mu - quantile_expectation(X) #mu - quantile_expectation(X)
+        pdf_exp_err = mu - pdf_expectation(X, pdf, normalize=True)
+
+        X = torch.tensor(X.reshape(1,-1), dtype=torch.float64)
+        pdf = torch.tensor(pdf.reshape(1,-1), dtype=torch.float64)
+        pdf_pt_exp_err = (mu - pdf_expectation_torch_batch(X, pdf, normalize=True)).numpy()[0]
+
+        print(f"Quantile Int Error E[X]: {quant_exp_err}")
+        print(f"PDF-weighted Error E[X]: {pdf_exp_err}")
+        print(f"PT-PDF-weighted Error E[X]: {pdf_pt_exp_err}")
+        best = 'PDF' if abs(pdf_exp_err) < abs(quant_exp_err) else 'Quantile'
+        print(f"Best Method: {best}")
+        # print(f"PDF-weighted Error E[X]: {mu - pdf_expectation(X, pdf, normalize=False )}")
+        # print(f"PDF-weighted Error E[X]: {mu - pdf_expectation2(X, pdf)}")
+
+
+####################################################################
+### LEARNING TOOLS #################################################
+####################################################################
 class OUNoiseBounded:
     """
     Ornstein–Uhlenbeck process with bounded state.
@@ -369,10 +662,11 @@ class ProspectReplayBuffer(ReplayBuffer):
         # ensure batched
         s = torch.as_tensor(s, dtype=torch.float32, device=self.device)
         a = torch.as_tensor(a, dtype=torch.float32, device=self.device)
+
+        # r_prospects = self._handle_certain_r_prospects(r_prospects) # handles edge case with multiple certain samples
         r_prospects = torch.as_tensor(r_prospects, dtype=torch.float32, device=self.device)
         s2 = torch.as_tensor(s2, dtype=torch.float32, device=self.device)
         d_prospects = torch.as_tensor(d_prospects, dtype=torch.float32, device=self.device).view(-1, 1)
-
 
 
         idxs = (self.ptr + torch.arange(n, device=self.device)) % self.size
@@ -385,6 +679,12 @@ class ProspectReplayBuffer(ReplayBuffer):
         self.ptr = (self.ptr + n) % self.size
         if self.ptr == 0:
             self.full = True
+
+    def _handle_certain_r_prospects(self, r_prospects):
+        probs = r_prospects[1,:]
+        if np.all(probs == 1):
+            r_prospects[1, :] /= np.sum(probs)
+        return r_prospects
 
 class Schedule:
     """
@@ -542,7 +842,8 @@ class Schedule:
         i = int(np.clip(idx, 0, self.horizon - 1))
         return float(self._schedule[i])
 
-    def plot(self, ax= None, T=None, show=True, label=None):
+    def plot(self, ax= None, T=None, show=True, label=None,
+             with_title = False):
         """Plots the schedule over T steps with a vertical line at current schedule step."""
         label = self._mode if label is None else label
 
@@ -565,7 +866,8 @@ class Schedule:
         # vertical line at current step (clamped to T-1)
         v = int(np.clip(self._schedule_step, 0, T - 1))
         ax.axvline(v, linestyle='--')
-        ax.set_title(f"Schedule ({self._mode}, step_event={self._step_event})")
+        if with_title:
+            ax.set_title(f"Schedule ({self._mode}, step_event={self._step_event})")
         ax.set_xlabel("Step")
         ax.set_ylabel("Value")
         # ax.tight_layout()
@@ -604,22 +906,23 @@ class Schedule:
 
 
 def main():
-    fig,axs = plt.subplots(1,2, figsize=(12,9))
-    sched = Schedule(xstart=0.5, xend=0.05, horizon=1000, mode='exponential',exp_gain=2.0)
-    sched.plot(axs[0], show =False, T=1000, label='exponential0', )
-    print(sched)
-
-    # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='exponential',exp_gain=2.0)
-    # sched.plot(axs[0], show=False, T=800, label='exponential1')
+    test_risk_sensitivity()
+    # fig,axs = plt.subplots(1,2, figsize=(12,9))
+    # sched = Schedule(xstart=0.5, xend=0.05, horizon=1000, mode='exponential',exp_gain=2.0)
+    # sched.plot(axs[0], show =False, T=1000, label='exponential0', )
+    # print(sched)
     #
-    # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='linear')
-    # sched.plot(axs[0], show =False, T=800)
-    #
-    # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, decay_rate=0.005, mode='decay')
-    # sched.plot(axs[0], show =False, T=800)
-    axs[0].legend()
-    plt.show()
-    pass
+    # # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='exponential',exp_gain=2.0)
+    # # sched.plot(axs[0], show=False, T=800, label='exponential1')
+    # #
+    # # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='linear')
+    # # sched.plot(axs[0], show =False, T=800)
+    # #
+    # # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, decay_rate=0.005, mode='decay')
+    # # sched.plot(axs[0], show =False, T=800)
+    # axs[0].legend()
+    # plt.show()
+    # pass
 
 if __name__ == '__main__':
     main()

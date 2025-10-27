@@ -9,11 +9,13 @@ import torch.optim as optim
 import torch.nn.functional as F
 from collections import deque
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from datetime import datetime
 
 
 from utils.file_management import save_pickle, load_pickle, load_latest_pickle, get_algorithm_dir
-from learning.utils import OUNoise,OUNoiseBounded, ReplayBuffer, ProspectReplayBuffer, Schedule
+from learning.utils import OUNoise,OUNoiseBounded, ReplayBuffer, ProspectReplayBuffer, Schedule, \
+    pdf_expectation_torch_batch, quantile_expectation
 
 # ===== Networks =====
 
@@ -87,8 +89,15 @@ class DDPGAgent:
     def __init__(self, env,
                  gamma=0.99,
                  tau=0.005,
+
                  actor_lr=1e-4,
+                 actor_num_hidden_layers = 3,
+                 actor_size_hidden_layers = 128,
+
                  critic_lr=1e-3,
+                 critic_num_hidden_layers=3,
+                 critic_size_hidden_layers=128,
+
                  buffer_size=int(1e5),
                  batch_size=256,
 
@@ -103,6 +112,7 @@ class DDPGAgent:
                  device=None,
                  **kwargs):
 
+        self.enable_print_report = True
         self.env = env
         self.gamma = gamma
         self.tau = tau
@@ -113,6 +123,8 @@ class DDPGAgent:
         self.warmup_epis = warmup_epis
         self.random_start_epis = random_start_epis
         self.start_time_str = datetime.now().strftime("%Y-%m-%d TIME: %H:%M:%S")
+        self.fig_title = kwargs.pop('fig_title', f'DDPG Agent ({self.start_time_str}')
+
 
         # dims
         self.state_dim  = env.observation_space.shape[0]
@@ -121,11 +133,25 @@ class DDPGAgent:
         self.a_high     = torch.tensor(env.action_space.high, dtype = torch.float32, device = self.device)
 
         # nets
-        self.actor       = ActorDeterministic(self.state_dim, self.action_dim).to(self.device)
-        self.critic      = CriticQ(self.state_dim           , self.action_dim).to(self.device)
-        self.actor_targ  = ActorDeterministic(self.state_dim, self.action_dim).to(self.device)
-        self.critic_targ = CriticQ(self.state_dim           , self.action_dim).to(self.device)
+        self.actor      = ActorDeterministic(self.state_dim, self.action_dim,
+                                              num_hidden_layers=actor_num_hidden_layers,
+                                              size_hidden_layers=actor_size_hidden_layers
+                                              ).to(self.device)
+        self.actor_targ = ActorDeterministic(self.state_dim, self.action_dim,
+                                            num_hidden_layers = actor_num_hidden_layers,
+                                            size_hidden_layers = actor_size_hidden_layers
+                                            ).to(self.device)
         self.actor_targ.load_state_dict(self.actor.state_dict())
+
+
+        self.critic      = CriticQ(self.state_dim, self.action_dim,
+                                   num_hidden_layers=critic_num_hidden_layers,
+                                   size_hidden_layers=critic_size_hidden_layers
+                                   ).to(self.device)
+        self.critic_targ = CriticQ(self.state_dim, self.action_dim,
+                                   num_hidden_layers=critic_num_hidden_layers,
+                                   size_hidden_layers=critic_size_hidden_layers
+                                   ).to(self.device)
         self.critic_targ.load_state_dict(self.critic.state_dict())
 
         self.optimA = optim.Adam(self.actor.parameters() , lr = actor_lr)
@@ -137,6 +163,7 @@ class DDPGAgent:
 
 
         # Logging and Schedules
+        self.max_episodes = None
         self.total_rollouts = 0
         self.total_steps = 0
 
@@ -217,12 +244,14 @@ class DDPGAgent:
 
     def train(self, max_episodes=1_000):
         raise NotImplementedError('Needs to be updated')
+        self.max_episodes = max_episodes
 
         ep_returns = deque(maxlen=self.rollouts_per_epi)
         ep_lens = deque(maxlen=self.rollouts_per_epi)
 
         total_steps = 0
         for ep in range(1, max_episodes + 1):
+
             s, _ = self.env.reset()
 
             self.ou.reset()
@@ -288,13 +317,41 @@ class DDPGAgent:
 
         return {"avg_return": np.mean(ep_returns), "avg_len": np.mean(ep_lens)}
 
-    def _spawn_figure(self):
+    def _spawn_figure(self,max_title_chars = 100):
+        from textwrap import wrap
+
         plt.ion()
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 4))
-        self.fig.suptitle(f'DDPG ({self.start_time_str})')
-        self.rew_ax = self.axes[0, 0]
-        self.render_ax = self.axes[0, 1]
-        self.loss_ax = self.axes[1, 0]
+
+        # Create a figure
+        self.fig = plt.figure(figsize=(12, 6), constrained_layout=True)
+        self.fig.suptitle(
+            '\n'.join(wrap(self.fig_title + f' ({self.start_time_str})', max_title_chars))
+            # self.fig_title + f' ({self.start_time_str})'
+        )
+
+        gs = gridspec.GridSpec(3, 2, width_ratios=[1, 2], height_ratios=[1, 1, 0.75], figure=self.fig)
+
+        # Left column: 3 stacked axes
+        self.rew_ax    = self.fig.add_subplot(gs[0, 0])
+        self.loss_ax = self.fig.add_subplot(gs[1, 0])
+        self.sched_ax   = self.fig.add_subplot(gs[2, 0])
+
+        # format last axis differently
+        for ax in [self.rew_ax, self.loss_ax]:
+            ax.set_xticks([])
+            ax.set_xticklabels([])
+        self.sched_ax.set_xlabel('Episode')
+
+        # Right column: single axis spanning all rows
+        self.render_ax = self.fig.add_subplot(gs[:, 1])
+        self.render_ax.set_xticks([])
+        self.render_ax.set_xticklabels([])
+        self.render_ax.set_yticks([])
+        self.render_ax.set_yticklabels([])
+
+        # Adjust layout
+        # plt.tight_layout()
+        plt.show()
 
     def _plot_history(self,
                       traj_history, terminal_history,
@@ -316,8 +373,8 @@ class DDPGAgent:
         if 'reward_line' not in self.fig_assets.keys():
             # self.fig_assets['reward_line'] = self.axes[0].plot(list(self.reward_history),lw=1,color='b')[0]
             self.fig_assets['reward_line'] = self.rew_ax.plot(x,mean, lw=lw, color='k')[0]
-            self.rew_ax.set_title('Reward (eps)')
-            self.rew_ax.set_xlabel('Episode')
+            # self.rew_ax.set_title('Reward (eps)')
+            # self.rew_ax.set_xlabel('Episode')
             self.rew_ax.set_ylabel('Total Reward')
 
             # plot 1 std deviation as shaded region
@@ -359,7 +416,7 @@ class DDPGAgent:
                 self.fig_assets['traj_lines'].append(self.render_ax.plot(traj[:,0], traj[:,1], **plt_params)[0])
 
             self.render_ax.set_title('Trajectories (last {} eps)'.format(len(traj_history)))
-            self.render_ax.set_xlabel('X'); self.render_ax.set_ylabel('Y')
+            # self.render_ax.set_xlabel('X'); self.render_ax.set_ylabel('Y')
         else:
             for i, traj, term in zip(np.arange(len(traj_history)),traj_history, terminal_history):
                 if term == 'goal_reached':  plt_params = {'color': 'green', 'alpha': 0.7,'lw':2*lw}
@@ -371,13 +428,11 @@ class DDPGAgent:
                 self.fig_assets['traj_lines'][i].set_color(plt_params['color'])
                 self.fig_assets['traj_lines'][i].set_alpha(plt_params['alpha'])
 
-        plt.tight_layout()
+        # plt.tight_layout()
         plt.draw()
         plt.pause(tpause)
 
-    def _plot_losses(self,
-                     actor_loss_history,
-                     critic_loss_history, tpause=0.1, log_interval=1):
+    def _plot_losses(self, actor_loss_history, critic_loss_history, tpause=0.1, log_interval=1,lw=0.5):
 
         if self.fig is None:
             self._spawn_figure()
@@ -385,13 +440,13 @@ class DDPGAgent:
         # Plot a dual axis loss plot
         x = np.arange(len(actor_loss_history)) * log_interval
         if 'actor_loss_line' not in self.fig_assets.keys():
-            self.fig_assets['actor_loss_line'], = self.loss_ax.plot(x, actor_loss_history, color='b', label='Actor Loss')
-            self.loss_ax.set_xlabel('Episode')
+            self.fig_assets['actor_loss_line'], = self.loss_ax.plot(x, actor_loss_history, color='b', label='Actor Loss', lw=lw)
+            # self.loss_ax.set_xlabel('Episode')
             self.loss_ax.set_ylabel('Actor Loss', color='b')
             self.loss_ax.tick_params(axis='y', labelcolor='b')
 
             self.loss_ax2 = self.loss_ax.twinx()
-            self.fig_assets['critic_loss_line'], = self.loss_ax2.plot(x, critic_loss_history, color='r', label='Critic Loss')
+            self.fig_assets['critic_loss_line'], = self.loss_ax2.plot(x, critic_loss_history, color='r', label='Critic Loss', lw=lw)
             self.loss_ax2.set_ylabel('Critic Loss', color='r')
             self.loss_ax2.tick_params(axis='y', labelcolor='r')
 
@@ -405,23 +460,49 @@ class DDPGAgent:
             self.loss_ax2.autoscale_view()
 
 
-        plt.tight_layout()
+        # plt.tight_layout()
         plt.draw()
         plt.pause(tpause)
 
+    def _plot_schedules(self, tpause=0.1, log_interval=1,lw=0.5,  **kwargs):
 
-    def _get_fpath(self, fname=None, suffix= '',
-                   save_dir = './models/', with_dir = True,
-                   with_tstamp=True):
+        assert len(kwargs) <= 2, "Can only plot up to 2 schedules at once."
+        max_val = 0
+        min_val = 0
+        for key, val in kwargs.items():
+            x = np.arange(len(val)) * log_interval
+            max_val = max(np.max(val), max_val)
+            min_val = min(np.min(val), min_val)
+            if key not in self.fig_assets.keys():
+                self.fig_assets[key], = self.sched_ax.plot(x, val, label=key,lw=lw)
+                self.sched_ax.legend(loc ='upper right')
+                self.sched_ax.set_ylabel('Schedules')
+            else:
+                self.fig_assets[key].set_data(x, val)
+
+        self.sched_ax.set_xlim(0, x[-1])
+        self.sched_ax.set_ylim(min_val*0.9, max_val*1.1)
+        # plt.tight_layout()
+        plt.draw()
+        plt.pause(tpause)
+
+    def _plot_spin(self):
+        """Call frequently to unfreeze plot """
+        if self.fig is not None:
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+
+    def _get_fpath(self, fname=None, prefix='', suffix= '', save_dir = './models/', with_dir = True, with_tstamp=True):
         assert not (fname is not None and suffix == ''), "Provide either a whole fname or a suffix, not both."
         # Format filename
-        layout =  self.env.layout if hasattr(self.env, 'layout') else self.env.get_attr('layout')[0]
-        tstamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if with_tstamp else ''
-        _fname = f'{tstamp}_DDPG_{layout}'
-        _fname += f'_{suffix}' if suffix != '' else ''
-        fname = fname if fname is not None else _fname
 
+        if fname is None:
+            layout =  self.env.layout if hasattr(self.env, 'layout') else self.env.get_attr('layout')[0]
+            tstamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if with_tstamp else ''
+            fname = f'{tstamp}_{self.__class__.__name__}_{layout}'
 
+        fname = f'{prefix}_{fname}' if prefix != '' else fname
+        fname = f'{fname}_{suffix}' if suffix != '' else fname
         return save_dir + fname
 
     def _get_fdata(self):
@@ -432,10 +513,16 @@ class DDPGAgent:
             'critic_targ': copy.deepcopy(self.critic_targ.state_dict()),
         }
 
-    def save(self, ):
+    def save(self, prefix='',suffix='' ):
         data = self._get_fdata()
-        fpath = self._get_fpath()
+        fpath = self._get_fpath(prefix=prefix,suffix=suffix)
         save_pickle(data, fpath)
+
+        # save fig as well
+        if self.fig is not None:
+            fig_fpath = fpath.replace('.pkl', '.png')
+            self.fig.savefig(fig_fpath)
+
         print(f"\nObject saved to {fpath}\n")
 
     def load(self, fpath):
@@ -468,11 +555,14 @@ class DDPGAgent_EUT(DDPGAgent):
     """
     Rational (Expected unitlity) agent that computes the expected utility over a distribution of rewards from dynamics models.
     """
-    def __init__(self, env, **kwargs):
+    def __init__(self, env, abstract_overrides = {}, **kwargs):
         super().__init__(env, **kwargs)
         del self.rollouts_per_epi
         del self.history
 
+
+
+        self.fig_title = kwargs.pop('fig_title', f'DDPG-EUT Agent ({self.start_time_str})')
         self.delay_steps = self.env.delay_steps
         self.update_interval = kwargs.pop('update_interval', 1)
 
@@ -526,13 +616,37 @@ class DDPGAgent_EUT(DDPGAgent):
             'terminal': deque(maxlen=self.log_interval),
             'timeseries_filt_rewards': np.zeros([0, 2]),
             'critic_loss': [],
-            'actor_loss': []
+            'actor_loss': [],
+            'ou_sigma': [],
+            'rand_start': []
         }
 
 
         self.reset_params = {
             'rand_action_gen': self.rand_action_gen
         }
+
+
+        self.set_global_overrides(**abstract_overrides) # set any top level overrides
+
+
+    def set_global_overrides(self, **kwargs):
+        # Parse remaining kwargs and set attributes
+        obj_list = [self, self.env,self.env.state, self.env.state.robot, self.ou]
+        for key, val in kwargs.items():
+
+            is_found = False
+            for _obj in obj_list:
+                # _k = key.split('.')[0] if '.' in key else key
+
+
+                if hasattr(_obj, key):
+                    setattr(_obj, key, val)
+                    is_found = True
+
+
+            if not is_found:
+                raise ValueError(f"Unknown kwarg {key} in ContinousNavEnv.")
 
 
     def rand_action_gen(self,*args, **kwargs):
@@ -548,7 +662,8 @@ class DDPGAgent_EUT(DDPGAgent):
             print(f'\r [{_spin[ep%len(_spin)]}] Running Warmup... [Prog: {int(ep/self.warmup_epis*100)}%]',end='',flush=True)
 
             # RESETS
-            self.env.reset(p_rand_state = 1 if self.random_start_epis>0 else 0, **self.reset_params)
+            p = self.rand_start_sched._x0 if self.random_start_epis>0 else 0
+            self.env.reset(p_rand_state = p, **self.reset_params)
             self.ou.reset()
 
 
@@ -576,6 +691,7 @@ class DDPGAgent_EUT(DDPGAgent):
         self.ou.reset_sigma()
 
     def train(self, max_episodes=1_000):
+        self.max_episodes = max_episodes
         self.warmup()
 
         running_rewards = 0
@@ -585,12 +701,11 @@ class DDPGAgent_EUT(DDPGAgent):
         running_critic_loss = deque(maxlen=self.env.max_steps)
 
         for ep in range(1, max_episodes + 1):
+            self._plot_spin()
             p_rand_state = self.rand_start_sched.sample(at=ep)
             # p_rand_state = max(0, (1 - ep / self.random_start_epis) if self.random_start_epis>0 else 0)
             self.env.reset(p_rand_state = p_rand_state,**self.reset_params)
             self.ou.reset()
-
-
 
             # ----------------------------------------------------------------------------
             for i in range(self.env.max_steps):
@@ -631,6 +746,9 @@ class DDPGAgent_EUT(DDPGAgent):
                     self.history['action'].append(np.mean(np.array(running_acts),axis=0)); running_acts.clear()
                     self.history['actor_loss'].append(np.mean(np.array(running_actor_loss)) if len(running_actor_loss)>0 else 0.0)
                     self.history['critic_loss'].append(np.mean(np.array(running_critic_loss)) if len(running_critic_loss)>0 else 0.0)
+                    self.history['ou_sigma'].append(np.mean(self.ou.sigma))
+                    self.history['rand_start'].append(p_rand_state)
+
                     running_actor_loss.clear()
                     running_critic_loss.clear()
 
@@ -648,17 +766,19 @@ class DDPGAgent_EUT(DDPGAgent):
 
 
             # LOG EPISODE #################################################################
-            print(f"[DDPG] Episode {ep} ({i} it; {i * self.env.dt:.1f}sec)"
-                  f"| AvgRet: {np.mean(self.history['ep_reward']):.2f} "
-                  f"| MemLen: {len(self.replay)}"
-                  f"| P(rand state):{p_rand_state:.2f}"
-                  f"| OU(sigma): {np.mean(self.ou.sigma): .3f}"
-                  f"| Terminal: {self.history['terminal'][-1]}"
-                  f"| Mean Act: {np.round(self.history['action'][-1],2)}"
-                  )
+            if self.enable_print_report:
+                print(f"[DDPG] Episode {ep} ({i} it; {i * self.env.dt:.1f}sec)"
+                      f"| AvgRet: {np.mean(self.history['ep_reward']):.2f} "
+                      f"| MemLen: {len(self.replay)}"
+                      f"| P(rand state):{p_rand_state:.2f}"
+                      f"| OU(sigma): {np.mean(self.ou.sigma): .3f}"
+                      f"| Terminal: {self.history['terminal'][-1]}"
+                      f"| Mean Act: {np.round(self.history['action'][-1],2)}"
+                      )
 
             if ep % self.log_interval == 0:
-                print("")
+                if self.enable_print_report: print("")
+
                 mu, std = np.mean(self.history['ep_reward']), np.std(self.history['ep_reward'])
                 self.history['timeseries_filt_rewards'] = np.vstack((
                     self.history['timeseries_filt_rewards'],
@@ -672,8 +792,12 @@ class DDPGAgent_EUT(DDPGAgent):
                 self._plot_losses(
                     actor_loss_history=self.history['actor_loss'],
                     critic_loss_history=self.history['critic_loss'],
-                    log_interval=self.log_interval
+                    log_interval=1
                 )
+                self._plot_schedules( ou_sigma = self.history['ou_sigma'],
+                                    rand_start = self.history['rand_start'],
+                                     log_interval=1
+                                   )
 
                 self.history['terminal'].clear()
                 self.history['ep_len'].clear()
@@ -686,7 +810,11 @@ class DDPGAgent_EUT(DDPGAgent):
         # ----- optimization -----
 
     def risk_measure(self,vals,probs):
-        return torch.sum(vals*probs, dim=1).squeeze() # rational expectation
+        """Computes rational expectation from vals and pdf (probs)."""
+        # return pdf_expectation_torch_batch(vals, probs)
+        expectations= quantile_expectation(vals)
+        return torch.tensor(expectations, dtype=torch.float32, device=self.device)
+
 
     def _update_sgd(self, updates=1):
         mean_critic_loss = 0.0
@@ -703,17 +831,19 @@ class DDPGAgent_EUT(DDPGAgent):
                 q_targ = self.critic_targ(o2, a2)
 
                 r_vals,r_probs = [r_prospects[:,i,:] for i in range(2)]
-                assert torch.all(torch.sum(r_probs, dim=1) == 1), 'Reward probabilities do not sum to 1.'
+                # assert torch.all(r_probs <= 1), 'Reward probabilities should be <= 1 (not necessarily sum to 1).'
 
-                d_prospects = d_prospects.squeeze(1)
-                # assert r_vals.shape == r_probs.shape == d_prospects.shape, ''
-                td_targets = r_vals + (1.0 - d_prospects) * self.gamma * q_targ
+                td_targets = r_vals + (1.0 - d_prospects.squeeze(1)) * self.gamma * q_targ
                 td_expectation = self.risk_measure(td_targets, r_probs)
+
                 assert td_expectation.shape == (self.batch_size,)
+                assert torch.all(torch.isfinite(td_expectation)), f'Non-finite td_expectation'
+                # assert np.all(np.isfinite(td_expectation.item())), f'Non-finite critic loss: {td_expectation.item()}'
+
 
                 # y = r + (1.0 - d) * self.gamma * q_targ
 
-            # Critic
+            # Critic ##############################################################
             q = self.critic(o1, a1).squeeze()
 
             critic_loss = F.mse_loss(q, td_expectation)
@@ -725,9 +855,11 @@ class DDPGAgent_EUT(DDPGAgent):
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
             self.optimC.step()
 
-            # Actor (maximize Q(s, pi(s)) -> minimize -Q)
+            # Actor (maximize Q(s, pi(s)) -> minimize -Q) ###############################
             a_pred = self._scale_to_bounds(self.actor(o1))
             actor_loss = -self.critic(o1, a_pred).mean()
+            assert np.isfinite(actor_loss.item()), f'Non-finite actor loss: {actor_loss.item()}'
+
             self.optimA.zero_grad()
             actor_loss.backward()
             if self.grad_clip:
@@ -825,6 +957,7 @@ class DDPGAgentVec(DDPGAgent):
         self.env.set_attr('p_rand_state', 0)
 
     def train(self, max_episodes=1_000):
+        self.max_episodes = max_episodes
         self.warmup()
 
         self.env.set_attr('enable_reset', True)
