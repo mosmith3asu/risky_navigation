@@ -333,7 +333,6 @@ class State_Lidar(StateBase):
           - obs['type'] != 'circle' as axis-aligned rectangle with keys:
               center (x,y), width, height
         """
-        import numpy as np
 
         p = np.array([x, y], dtype=np.float64)
         u = np.array([np.cos(δ), np.sin(δ)], dtype=np.float64)  # ray direction, |u|=1
@@ -1062,7 +1061,7 @@ def main():
     # layout_dict = read_layout_dict('example1')
     layout_dict = read_layout_dict('example2')
 
-    layout_dict['vgraph_resolution'] = (25, 25)  # resolution for visibility graph
+    layout_dict['vgraph_resolution'] = (10, 10)  # resolution for visibility graph
     env = ContinuousNavigationEnvBase(**layout_dict)
     obs = env.reset()
 

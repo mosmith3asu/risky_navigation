@@ -1,0 +1,10 @@
+{
+    "goal":(8.0, 8.0),
+    "start_pos": (3.0, 3.0),
+    "start_heading": -45,
+    "obstacles":[
+          {'type': 'rect', 'center': (5, 7.5), 'width': 1.0, 'height': 8},
+                   {'type': 'circle', 'center': (5, 3.5), 'radius': 0.5}
+    ],
+    "bounds":((0.0, 0.0), (10.0, 10.0)),
+}

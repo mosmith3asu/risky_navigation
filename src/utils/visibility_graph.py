@@ -1,28 +1,57 @@
+import sys
+import os
+import pickle
 import numpy as np
 from shapely.geometry import Point, LineString, Polygon
 import networkx as nx
 import math
+import hashlib
+import json
 
 class VisibilityGraph:
     """A class to build a visibility graph for the continuous navigation environment."""
 
-    def __init__(self, goal, obstacles, bounds, resolution=(20, 20)):
-        if np.any(np.array(resolution) < 20):
-            print("Warning: visibility graph resolution is very low; consider increasing to at least (20,20) for better accuracy.")
-        print('Precomuting visibility graph...', end=' ')
+    def __init__(self, goal, obstacles, bounds, resolution=(20, 20),cached=True):
+        if isinstance(resolution, int):
+            dx = (bounds[1][0] - bounds[0][0])
+            dy = (bounds[1][1] - bounds[0][1])
+            dmax = max(dx, dy)
+            resolution = (int(resolution * (dx / dmax)), int(resolution * (dy / dmax)))
+
+        if resolution[0]*resolution[1] < 20*20:
+            print(f"Warning: visibility graph resolution {resolution} may be low; "
+                  f"consider increasing to at least 400 elements (e.g., 20x20) for better accuracy." ,file=sys.stderr)
+
+        print('Precomuting visibility graph...')
         self.goal = tuple(goal)
         self.obstacles = [self.create_poly(obstacle) for obstacle in obstacles]
-        self.grid = self.create_grid(bounds, resolution)
-        self.graph = self.build_graph(self.grid)
-        self.dist_grid,self.norm_grid = self.precompute_distances(self.grid, self.graph)
+        self.bounds = bounds
+        self.resolution = resolution
+        self.cached = cached
 
-        self.invalid_mask = np.where(self.norm_grid == np.inf, True,False)
-        self.invalid_offset = 1e6*self.invalid_mask
-        print('\t finished.')
 
-        self.max_dist = np.max(self.norm_grid[~self.invalid_mask])  # max distance to goal in valid grid points
+        if self.cached and self.is_cached():
+            self.load_cache()
+        else:
+            print('\t| Recomputing...')
+            print('\t| Creating grid...')
+            self.grid = self.create_grid(bounds, resolution)
+            print('\t| Building graph...')
+            self.graph = self.build_graph(self.grid)
+            print('\t| Computing distances grid...')
+            self.dist_grid,self.norm_grid = self.precompute_distances(self.grid, self.graph)
+            self.invalid_mask = np.where(self.norm_grid == np.inf, True,False)
+            self.invalid_offset = 1e6*self.invalid_mask
+            self.max_dist = np.max(self.norm_grid[~self.invalid_mask])  # max distance to goal in valid grid points
+            if self.cached:
+                print('\t| saving to cache...')
+                self.save_cache()
+        print('\t| finished.')
 
     def closest_idx(self, x, y):
+        # if self.is_compiled:
+        #     return self._compiled_funs.closest_idx(x, y)
+
         dx_grid = self.grid[:, :, 0] + self.invalid_offset - x
         dy_grid = self.grid[:, :, 1] + self.invalid_offset - y
         dist_grid = np.sqrt(np.power(dx_grid, 2) + np.power(dy_grid, 2))
@@ -53,6 +82,8 @@ class VisibilityGraph:
         Uses the vector field produced by precompute_distances(). If no valid grid point
         exists (unreachable/inside obstacle), returns (np.nan, np.nan).
         """
+
+
         r, c = self.closest_idx(x, y)
         dist2goal = self.dist_grid[r, c]
         dist2grid = np.abs(self.grid[r, c] - np.array([x, y], dtype=float))
@@ -65,10 +96,18 @@ class VisibilityGraph:
         Convert Cartesian coordinates (x, y) to spherical coordinates (r, theta).
         r is the distance from the origin, and theta is the angle in radians.
         """
+
+
         dx,dy = self.dist_xy(x, y)
         r = np.sqrt(dx ** 2 + dy ** 2)
         theta = np.arctan2(dy, dx) - theta
         return np.array([r, theta], dtype=np.float32)
+
+    def get_compiled_funs(self):
+        f = Compiled_Dist2GoalFun(self.grid, self.norm_grid, self.dist_grid)
+        return f.dist_dtheta
+
+        # return Compiled_Dist2GoalFun(self.grid, self.norm_grid, self.dist_grid)
 
     # ----------------- helpers & builders -----------------
 
@@ -196,8 +235,6 @@ class VisibilityGraph:
 
         return dx_dy_grid, norm_grid
 
-
-
     def shortest_path(self, start, goal, graph=None):
         """
         Find the shortest path from start to goal in the visibility graph.
@@ -236,5 +273,179 @@ class VisibilityGraph:
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None
 
+    # ----------------- saves/cache methods -----------------
+    def load_cache(self):
+        fname = self.get_fname()
+        fdir = self.get_fdir()
+        fpath = os.path.join(fdir, fname)
+        with open(fpath, 'rb') as f:
+            cached_obj = pickle.load(f)
+            self.grid = cached_obj.grid
+            self.graph = cached_obj.graph
+            self.dist_grid = cached_obj.dist_grid
+            self.norm_grid = cached_obj.norm_grid
+            self.invalid_mask = cached_obj.invalid_mask
+            self.invalid_offset = cached_obj.invalid_offset
+            self.max_dist = cached_obj.max_dist
+            print('\t| loaded from cache.')
+
+    def save_cache(self):
+        # save this object to a pickle file
+        fname = self.get_fname()
+        fdir = self.get_fdir()
+        fpath = os.path.join(fdir, fname)
+        with open(fpath, 'wb') as f:
+            pickle.dump(self, f)
+
+    def is_cached(self):
+        fname = self.get_fname()
+        fdir = self.get_fdir()
+        fpath = os.path.join(fdir, fname)
+        return os.path.exists(fpath)
+
+    def get_fdir(self):
+        utils_dir = os.path.dirname(os.path.abspath(__file__))
+        filepath = os.path.join(utils_dir, 'visibility_graph_cache')
+        if not os.path.exists(filepath):
+            os.makedirs(filepath)
+        return filepath
+
+    def get_fname(self):
+        hash_dict = {
+            'goal': str(self.goal),
+            'obstacles': str(self.obstacles),
+            'bounds': str(self.bounds),
+            'resolution': str(self.resolution)
+        }
+        hash_str = json.dumps(hash_dict, sort_keys=True,separators=(',', ':')).encode('utf-8')
+        return 'vgraph_' + str(hashlib.sha256(hash_str).hexdigest()) + '.pkl'
+        # return f"vgraph_cache_{hash(frozenset(hash_dict.items()))}.pkl"
+        # hash_str = str(hash_dict)
+        # invalid_fname_chars = ['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>', '.', ' ', '(', ')', ',', '[', ']', '{', '}', ':',"'",'"']
+        # for char in invalid_fname_chars:
+        #     hash_str = hash_str.replace(char, '')
+        # return hash_str + '.pkl'
 
 
+from numba import types, njit
+from numba.experimental import jitclass
+
+# ----- JIT class spec -----
+spec = [
+    ('grid',        types.float64[:, :, :]),  # (H, W, 2) grid of xy coords
+    ('norm_grid',   types.float64[:, :]),     # (H, W) scalar field (e.g., distance-to-goal)
+    ('dist_grid',   types.float64[:, :, :]),  # (H, W, 2) vector field of shortest-path step (dx, dy)
+    ('invalid_mask',types.boolean[:, :]),     # (H, W) True where norm_grid == inf
+    ('invalid_offset', types.float64[:, :]),  # (H, W) big number where invalid to push them away
+]
+
+@jitclass(spec)
+class Compiled_Dist2GoalFun:
+    def __init__(self, grid, norm_grid, dist_grid):
+        self.grid = grid
+        self.norm_grid = norm_grid
+        self.dist_grid = dist_grid
+
+        # invalid where norm_grid == inf
+        self.invalid_mask = np.isinf(self.norm_grid)
+        self.invalid_offset = self.invalid_mask.astype(np.float64) * 1e6
+
+    # def __call__(self, x, y, theta):
+    #     return self.dist_dtheta(x, y, theta)
+
+    def closest_idx(self, x, y):
+        """
+        Among the 4 nearest Euclidean grid points to (x,y),
+        choose the one with the smallest norm_grid.
+        """
+        # Add a huge offset to invalid cells so they won't be chosen
+        dx_grid = (self.grid[:, :, 0] + self.invalid_offset) - x
+        dy_grid = (self.grid[:, :, 1] + self.invalid_offset) - y
+
+        d2 = dx_grid * dx_grid + dy_grid * dy_grid
+        # Work on flattened array for partial selection
+        flat = d2.ravel()
+        n = flat.size
+        k = 4 if n >= 4 else n
+
+        # indices of k smallest (unsorted) by Euclidean distance
+        kth = k - 1 if k > 0 else 0
+        idxs = np.argpartition(flat, kth)[:k]
+
+        # Choose among these by minimal norm_grid value
+        H = d2.shape[0]
+        W = d2.shape[1]
+        best_r = 0
+        best_c = 0
+        best_val = 1.0e300
+
+        for j in range(k):
+            idx = idxs[j]
+            r = idx // W
+            c = idx - r * W
+            val = self.norm_grid[r, c]
+            if val < best_val:
+                best_val = val
+                best_r = r
+                best_c = c
+
+        return best_r, best_c
+
+    def dist_xy(self, x, y):
+        """
+        Return the (dx, dy) = shortest-path step from the nearest valid grid point to (x,y),
+        plus the small correction from the grid point to the exact (x,y) (L1 in original code).
+        If no valid exists, behavior is defined by offsets pushing invalid far away.
+        """
+
+        r, c = self.closest_idx(x, y)
+
+        # shortest-path step vector field at grid point
+        v = self.dist_grid[r, c, :]  # shape (2,)
+
+        # correction from grid cell center to (x,y)
+        # out = np.empty(2, dtype=np.float64)
+        # out[0] = v[0] + np.abs(self.grid[r, c, 0] - x)
+        # out[1] = v[1] + np.abs(self.grid[r, c, 1] - y)
+        dx = v[0] + np.abs(self.grid[r, c, 0] - x)
+        dy = v[1] + np.abs(self.grid[r, c, 1] - y)
+        return dx,dy
+
+    def dist_dtheta(self, X):
+        """
+        Convert the (dx,dy) vector into polar (r, theta_rel),
+        where theta_rel = atan2(dy,dx) - theta.
+        """
+        r, theta_rel = np.zeros(X.shape[0], dtype=np.float64), np.zeros(X.shape[0], dtype=np.float64)
+        for i in range(X.shape[0]):
+            x, y, v, theta = X[i].T
+            d = self.dist_xy(x, y)
+            dx = d[0]
+            dy = d[1]
+            r[i] = np.sqrt(dx * dx + dy * dy)
+            theta_rel[i] = np.arctan2(dy, dx) - theta
+        # out = np.empty(2, dtype=np.float32)
+        # out[0] = r
+        # out[1] = theta_rel
+        # return out
+        return r, theta_rel
+
+# ---------- Helper to build the jitclass instance ----------
+def make_compiled_dist2goal(grid, norm_grid, dist_grid):
+    """
+    Ensure float64 arrays and correct shapes, then construct the compiled class.
+    grid:      (H,W,2) float array of xy coordinates
+    norm_grid: (H,W)   float array (e.g., distance-to-goal scalar field)
+    dist_grid: (H,W,2) float array of vector field steps (dx,dy)
+    """
+    g = np.ascontiguousarray(grid, dtype=np.float64)
+    ng = np.ascontiguousarray(norm_grid, dtype=np.float64)
+    dg = np.ascontiguousarray(dist_grid, dtype=np.float64)
+    return Compiled_Dist2GoalFun(g, ng, dg)
+
+# ---------- Example usage ----------
+# grid      = np.stack(np.meshgrid(np.arange(W), np.arange(H)), axis=-1).astype(np.float64)
+# norm_grid = np.zeros((H,W), dtype=np.float64)  # put your field here
+# dist_grid = np.zeros((H,W,2), dtype=np.float64)  # put your vector field here
+# f = make_compiled_dist2goal(grid, norm_grid, dist_grid)
+# r_theta = f(x=1.2, y=3.4, theta=0.5)  # returns np.float32[2] = [r, theta_rel]
