@@ -105,11 +105,8 @@ class BayesianAgent:
         self.lr = lr
         self.prior_std = prior_std
         
-        # For RL: if goal_dim is 0, state_dim already includes goal
-        if goal_dim == 0:
-            input_dim = state_dim  # Already includes goal for RL
-        else:
-            input_dim = state_dim + action_dim + goal_dim  # Supervised mode
+        # For behavioral cloning: state_dim includes state+goal concatenated
+        input_dim = state_dim
         
         # Initialize encoder and decoder
         self.encoder = BayesianEncoder(input_dim, latent_dim, prior_std).to(self.device)
@@ -283,11 +280,7 @@ class BayesianAgent:
             # Update parameters
             if 'latent_dim' in param_dict:
                 self.latent_dim = param_dict['latent_dim']
-                # Calculate input_dim based on mode
-                if self.goal_dim == 0:
-                    input_dim = self.state_dim  # RL mode
-                else:
-                    input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+                input_dim = self.state_dim  # state_dim includes state+goal
                 self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
                 self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
             
@@ -319,11 +312,7 @@ class BayesianAgent:
             # Reset with best architecture
             if 'latent_dim' in best_params:
                 self.latent_dim = best_params['latent_dim']
-                # Calculate input_dim based on mode
-                if self.goal_dim == 0:
-                    input_dim = self.state_dim  # RL mode
-                else:
-                    input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+                input_dim = self.state_dim  # state_dim includes state+goal
                 self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
                 self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
             
@@ -373,11 +362,7 @@ class BayesianAgent:
             
             # Reset model with new parameters
             self.latent_dim = latent_dim
-            # Calculate input_dim based on mode
-            if self.goal_dim == 0:
-                input_dim = self.state_dim  # RL mode
-            else:
-                input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+            input_dim = self.state_dim  # state_dim includes state+goal
             self.encoder = BayesianEncoder(input_dim, latent_dim, prior_std).to(self.device)
             self.decoder = BayesianDecoder(latent_dim, self.action_dim, prior_std).to(self.device)
             
@@ -394,11 +379,7 @@ class BayesianAgent:
         # Apply best parameters
         best_params = study.best_params
         self.latent_dim = best_params['latent_dim']
-        # Calculate input_dim based on mode
-        if self.goal_dim == 0:
-            input_dim = self.state_dim  # RL mode
-        else:
-            input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+        input_dim = self.state_dim  # state_dim includes state+goal
         self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
         self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
         
@@ -514,11 +495,7 @@ class BayesianAgent:
     
     def _reset_model(self):
         """Reset model to initial state."""
-        # Calculate input_dim based on mode
-        if self.goal_dim == 0:
-            input_dim = self.state_dim  # RL mode
-        else:
-            input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+        input_dim = self.state_dim  # state_dim includes state+goal
         self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
         self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
     

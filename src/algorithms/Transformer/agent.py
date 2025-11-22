@@ -28,8 +28,8 @@ class PositionalEncoding(nn.Module):
 
 class TransformerModel(nn.Module):
     """
-    Transformer model for next-action prediction.
-    Uses self-attention to capture complex relationships between state, action, and goal.
+    Transformer model for behavioral cloning.
+    Uses self-attention to map from state+goal to action.
     """
     def __init__(self, state_dim, action_dim, goal_dim, d_model=64, nhead=4, num_layers=2, dropout=0.1):
         super().__init__()
@@ -37,17 +37,9 @@ class TransformerModel(nn.Module):
         self.action_dim = action_dim
         self.goal_dim = goal_dim
         self.d_model = d_model
-        self.rl_mode = (goal_dim == 0)  # RL mode if goal_dim is 0
         
-        # Input embeddings
-        if self.rl_mode:
-            # For RL: state_dim already includes goal, no action embedding needed
-            self.state_goal_embedding = nn.Linear(state_dim, d_model)
-        else:
-            # For supervised: separate embeddings
-            self.state_embedding = nn.Linear(state_dim, d_model)
-            self.action_embedding = nn.Linear(action_dim, d_model)
-            self.goal_embedding = nn.Linear(goal_dim, d_model)
+        # For behavioral cloning: state_dim already includes goal
+        self.state_goal_embedding = nn.Linear(state_dim, d_model)
         
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model)
@@ -60,31 +52,21 @@ class TransformerModel(nn.Module):
         # Output head
         self.output_layer = nn.Linear(d_model, action_dim)
         
-    def forward(self, state, goal=None):
+    def forward(self, state_goal):
         """
-        Forward pass for both RL and supervised modes.
-        
-        RL mode (goal=None): state contains state+goal concatenated
-        Supervised mode (goal provided): state, goal are separate
+        Forward pass for behavioral cloning.
         
         Args:
-            state: [batch_size, state_dim] (RL) or [batch_size, state_dim] (supervised)
-            goal: [batch_size, goal_dim] or None
+            state_goal: [batch_size, state_dim] where state_dim includes state+goal concatenated
             
         Returns:
             action_pred: [batch_size, action_dim]
         """
-        batch_size = state.shape[0]
+        batch_size = state_goal.shape[0]
         
-        if self.rl_mode or goal is None:
-            # RL mode: state already includes goal
-            state_goal_emb = self.state_goal_embedding(state).unsqueeze(1)  # [batch_size, 1, d_model]
-            sequence = state_goal_emb
-        else:
-            # Supervised mode: separate state and goal
-            state_emb = self.state_embedding(state).unsqueeze(1)  # [batch_size, 1, d_model]
-            goal_emb = self.goal_embedding(goal).unsqueeze(1)  # [batch_size, 1, d_model]
-            sequence = torch.cat([state_emb, goal_emb], dim=1)  # [batch_size, 2, d_model]
+        # Embed state+goal
+        state_goal_emb = self.state_goal_embedding(state_goal).unsqueeze(1)  # [batch_size, 1, d_model]
+        sequence = state_goal_emb
         
         # Add positional encoding
         sequence = self.pos_encoder(sequence)

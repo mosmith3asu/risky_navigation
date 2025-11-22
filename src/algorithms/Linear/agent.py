@@ -8,11 +8,8 @@ import copy
 class LinearModel(nn.Module):
     def __init__(self, state_dim, action_dim, goal_dim, weight_decay=0.0):
         super().__init__()
-        # For RL: if goal_dim is 0, state_dim already includes goal
-        if goal_dim == 0:
-            input_dim = state_dim  # Already includes goal for RL
-        else:
-            input_dim = state_dim + action_dim + goal_dim  # Supervised mode
+        # For behavioral cloning: state_dim includes state+goal concatenated
+        input_dim = state_dim
         self.linear = nn.Linear(input_dim, action_dim)
         self.weight_decay = weight_decay
         

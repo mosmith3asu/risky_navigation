@@ -10,12 +10,9 @@ class AutoEncoder(nn.Module):
                  activation='ReLU', dropout=0.0, batch_norm=False):
         super().__init__()
         
-        # For RL: if goal_dim is 0, state_dim already includes goal
-        # For supervised: state_dim + action_dim + goal_dim
-        if goal_dim == 0:
-            input_dim = state_dim  # Already includes goal for RL
-        else:
-            input_dim = state_dim + action_dim + goal_dim  # Supervised mode
+        # For behavioral cloning: state_dim includes state+goal concatenated
+        # goal_dim should be 0 (signal that goal is already in state_dim)
+        input_dim = state_dim
         output_dim = action_dim
         
         # Ensure hidden_dims represents intermediate layers before the latent bottleneck
