@@ -120,8 +120,14 @@ class BayesianAgent:
         # Number of prediction samples for uncertainty estimation
         self.n_samples = 10
     
-    def train_step(self, state, action, goal, next_action):
-        """Train the model on a batch of data"""
+    def train_step(self, state, action, goal, expert_action):
+        """Train the model for behavioral cloning.
+        Args:
+            state: Current states
+            action: Not used in RL mode (kept for compatibility)
+            goal: Goal positions
+            expert_action: Expert actions to imitate
+        """
         self.encoder.train()
         self.decoder.train()
         
@@ -131,19 +137,18 @@ class BayesianAgent:
         
         # Move data to device
         state = torch.tensor(state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(action, dtype=torch.float32, device=self.device)
         goal = torch.tensor(goal, dtype=torch.float32, device=self.device)
-        next_action = torch.tensor(next_action, dtype=torch.float32, device=self.device)
+        expert_action = torch.tensor(expert_action, dtype=torch.float32, device=self.device)
         
-        # Concatenate inputs
-        inputs = torch.cat([state, action, goal], dim=-1)
+        # Concatenate state and goal (no current action)
+        inputs = torch.cat([state, goal], dim=-1)
         
         # Forward pass
         z = self.encoder(inputs)
         mean, var = self.decoder(z)
         
         # Calculate negative log likelihood loss (Gaussian likelihood)
-        nll = 0.5 * (((next_action - mean)**2 / var) + torch.log(var)).sum(dim=1).mean()
+        nll = 0.5 * (((expert_action - mean)**2 / var) + torch.log(var)).sum(dim=1).mean()
         
         # Calculate KL divergence
         kl = self.encoder.kl + self.decoder.kl
@@ -163,21 +168,25 @@ class BayesianAgent:
         }
     
     def predict_next_action(self, state, action, goal):
-        """Predict the next action with uncertainty"""
+        """Legacy method - redirects to predict_action."""
+        pred_mean, pred_std = self.predict_action(state, goal)
+        return pred_mean, pred_std
+    
+    def predict_action(self, state, goal):
+        """Predict action from state and goal with uncertainty."""
         self.encoder.eval()
         self.decoder.eval()
         
         # Prepare inputs
         state = torch.tensor(state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(action, dtype=torch.float32, device=self.device)
         goal = torch.tensor(goal, dtype=torch.float32, device=self.device)
         
         if state.ndim == 1:
             state = state.unsqueeze(0)
-            action = action.unsqueeze(0)
             goal = goal.unsqueeze(0)
         
-        inputs = torch.cat([state, action, goal], dim=-1)
+        # Concatenate state and goal
+        inputs = torch.cat([state, goal], dim=-1)
         
         # Get samples for uncertainty estimation
         predictions = []

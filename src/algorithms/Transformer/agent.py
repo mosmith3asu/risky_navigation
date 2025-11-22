@@ -54,43 +54,39 @@ class TransformerModel(nn.Module):
         # Output head
         self.output_layer = nn.Linear(d_model, action_dim)
         
-    def forward(self, state, action, goal):
+    def forward(self, state, goal):
         """
-        Forward pass through the transformer model.
+        Forward pass for RL: input is state+goal, output is action.
         
         Args:
             state: [batch_size, state_dim]
-            action: [batch_size, action_dim]
             goal: [batch_size, goal_dim]
             
         Returns:
-            next_action_pred: [batch_size, action_dim]
+            action_pred: [batch_size, action_dim]
         """
         batch_size = state.shape[0]
         
-        # Create embeddings for each input
+        # Create embeddings for state and goal only
         state_emb = self.state_embedding(state).unsqueeze(1)  # [batch_size, 1, d_model]
-        action_emb = self.action_embedding(action).unsqueeze(1)  # [batch_size, 1, d_model]
         goal_emb = self.goal_embedding(goal).unsqueeze(1)  # [batch_size, 1, d_model]
         
         # Concatenate embeddings to form a sequence
-        sequence = torch.cat([state_emb, action_emb, goal_emb], dim=1)  # [batch_size, 3, d_model]
+        sequence = torch.cat([state_emb, goal_emb], dim=1)  # [batch_size, 2, d_model]
         
         # Add positional encoding
         sequence = self.pos_encoder(sequence)
         
         # Apply transformer encoder
-        output = self.transformer_encoder(sequence)  # [batch_size, 3, d_model]
+        output = self.transformer_encoder(sequence)  # [batch_size, 2, d_model]
         
-        # Use the full context output (all 3 tokens) for prediction
-        # We could also just use the last token, but using the mean across tokens
-        # captures all the information
+        # Use the mean across tokens to capture all information
         output = output.mean(dim=1)  # [batch_size, d_model]
         
         # Project to action space
-        next_action_pred = self.output_layer(output)  # [batch_size, action_dim]
+        action_pred = self.output_layer(output)  # [batch_size, action_dim]
         
-        return next_action_pred
+        return action_pred
 
 class TransformerAgent:
     """
@@ -141,27 +137,26 @@ class TransformerAgent:
         self.best_val_loss = float('inf')
         self.best_state_dict = None
     
-    def train_step(self, state, action, goal, next_action):
+    def train_step(self, state, action, goal, expert_action):
         """
-        Perform a single training step.
+        Perform a single training step for behavioral cloning.
         
         Args:
             state: Current state (batch)
-            action: Current action (batch)
+            action: Not used in RL mode (kept for compatibility)
             goal: Goal position (batch)
-            next_action: Next action to predict (batch)
+            expert_action: Expert action to imitate (batch)
             
         Returns:
             float: Loss value
         """
         self.model.train()
         state = torch.tensor(state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(action, dtype=torch.float32, device=self.device)
         goal = torch.tensor(goal, dtype=torch.float32, device=self.device)
-        next_action = torch.tensor(next_action, dtype=torch.float32, device=self.device)
+        expert_action = torch.tensor(expert_action, dtype=torch.float32, device=self.device)
         
-        pred = self.model(state, action, goal)
-        loss = self.loss_fn(pred, next_action)
+        pred = self.model(state, goal)
+        loss = self.loss_fn(pred, expert_action)
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -174,35 +169,37 @@ class TransformerAgent:
         return loss.item()
     
     def predict_next_action(self, state, action, goal):
+        """Legacy method - redirects to predict_action."""
+        return self.predict_action(state, goal)
+    
+    def predict_action(self, state, goal):
         """
-        Predict the next action given current state, action and goal.
+        Predict action given current state and goal.
         
         Args:
             state: Current state
-            action: Current action
             goal: Goal position
             
         Returns:
-            numpy.ndarray: Predicted next action
+            numpy.ndarray: Predicted action
         """
         self.model.eval()
         with torch.no_grad():
             state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            action = torch.tensor(action, dtype=torch.float32, device=self.device).unsqueeze(0)
             goal = torch.tensor(goal, dtype=torch.float32, device=self.device).unsqueeze(0)
             
-            pred = self.model(state, action, goal)
+            pred = self.model(state, goal)
             return pred.cpu().numpy().squeeze(0)
     
-    def validate(self, states, actions, goals, next_actions):
+    def validate(self, states, actions, goals, expert_actions):
         """
         Validate the model on a validation set.
         
         Args:
             states: Batch of states
-            actions: Batch of actions
+            actions: Not used in RL mode
             goals: Batch of goals
-            next_actions: Batch of next actions to predict
+            expert_actions: Batch of expert actions to predict
             
         Returns:
             float: Validation loss
@@ -210,12 +207,11 @@ class TransformerAgent:
         self.model.eval()
         with torch.no_grad():
             states = torch.tensor(states, dtype=torch.float32, device=self.device)
-            actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
             goals = torch.tensor(goals, dtype=torch.float32, device=self.device)
-            next_actions = torch.tensor(next_actions, dtype=torch.float32, device=self.device)
+            expert_actions = torch.tensor(expert_actions, dtype=torch.float32, device=self.device)
             
-            preds = self.model(states, actions, goals)
-            val_loss = self.loss_fn(preds, next_actions).item()
+            preds = self.model(states, goals)
+            val_loss = self.loss_fn(preds, expert_actions).item()
             
             # Update scheduler based on validation loss
             self.scheduler.step(val_loss)

@@ -74,16 +74,15 @@ class AutoEncoder(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
     
-    def forward(self, state, action, goal):
-        x = torch.cat([state, action, goal], dim=-1)
-        encoded = self.encoder(x)
+    def forward(self, state_goal):
+        """For RL: input is state+goal, output is action."""
+        encoded = self.encoder(state_goal)
         decoded = self.decoder(encoded)
         return decoded
     
-    def encode(self, state, action, goal):
+    def encode(self, state_goal):
         """Get latent representation."""
-        x = torch.cat([state, action, goal], dim=-1)
-        return self.encoder(x)
+        return self.encoder(state_goal)
 
 class AutoEncoderAgent:
     def __init__(self, state_dim, action_dim, goal_dim, latent_dim=64, hidden_dims=None,
@@ -443,22 +442,31 @@ class AutoEncoderAgent:
 
         return train_losses, val_losses
     
-    def train_step(self, states, actions, goals, next_actions):
-        """Single training step."""
+    def train_step(self, states, actions, goals, expert_actions):
+        """Single training step for behavioral cloning.
+        Args:
+            states: Current states
+            actions: Not used in RL mode (kept for compatibility)
+            goals: Goal positions
+            expert_actions: Expert actions to imitate
+        """
         self.optimizer.zero_grad()
         
-        predicted_actions = self.model(states, actions, goals)
-        loss = self.loss_fn(predicted_actions, next_actions)
+        # Concatenate state and goal (no current action needed)
+        state_goal = torch.cat([states, goals], dim=-1)
+        predicted_actions = self.model(state_goal)
+        loss = self.loss_fn(predicted_actions, expert_actions)
         
         loss.backward()
         self.optimizer.step()
         
         return loss.item()
     
-    def validate(self, states, actions, goals, next_actions):
-        """Validation step."""
-        predicted_actions = self.model(states, actions, goals)
-        loss = self.loss_fn(predicted_actions, next_actions)
+    def validate(self, states, actions, goals, expert_actions):
+        """Validation step for behavioral cloning."""
+        state_goal = torch.cat([states, goals], dim=-1)
+        predicted_actions = self.model(state_goal)
+        loss = self.loss_fn(predicted_actions, expert_actions)
         return loss.item()
     
     def predict(self, states, actions, goals):

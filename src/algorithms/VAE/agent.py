@@ -106,10 +106,10 @@ class VAEAgent:
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def forward(self, states, actions, goals):
-        """Forward pass through VAE"""
-        # Concatenate inputs
-        inputs = torch.cat([states, actions, goals], dim=-1)
+    def forward(self, states, goals):
+        """Forward pass through VAE for RL: input is state+goal, output is action."""
+        # Concatenate state and goal (no current action)
+        inputs = torch.cat([states, goals], dim=-1)
         
         # Encode
         mu, logvar = self.encoder(inputs)
@@ -122,12 +122,12 @@ class VAEAgent:
         
         return reconstruction, mu, logvar
     
-    def compute_loss(self, states, actions, goals, next_actions):
-        """Compute VAE loss (reconstruction + KL divergence)"""
-        reconstruction, mu, logvar = self.forward(states, actions, goals)
+    def compute_loss(self, states, goals, expert_actions):
+        """Compute VAE loss for behavioral cloning."""
+        reconstruction, mu, logvar = self.forward(states, goals)
         
         # Reconstruction loss (MSE)
-        recon_loss = F.mse_loss(reconstruction, next_actions, reduction='mean')
+        recon_loss = F.mse_loss(reconstruction, expert_actions, reduction='mean')
         
         # KL divergence loss
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / states.size(0)
@@ -141,19 +141,24 @@ class VAEAgent:
             'kl_loss': kl_loss
         }
     
-    def train_step(self, states, actions, goals, next_actions):
-        """Single training step"""
+    def train_step(self, states, actions, goals, expert_actions):
+        """Single training step for behavioral cloning.
+        Args:
+            states: Current states
+            actions: Not used in RL mode (kept for compatibility)
+            goals: Goal positions
+            expert_actions: Expert actions to imitate
+        """
         self.encoder.train()
         self.decoder.train()
         
         # Convert to tensors
         states = torch.tensor(states, dtype=torch.float32, device=self.device)
-        actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
         goals = torch.tensor(goals, dtype=torch.float32, device=self.device)
-        next_actions = torch.tensor(next_actions, dtype=torch.float32, device=self.device)
+        expert_actions = torch.tensor(expert_actions, dtype=torch.float32, device=self.device)
         
         # Forward pass and compute loss
-        loss_dict = self.compute_loss(states, actions, goals, next_actions)
+        loss_dict = self.compute_loss(states, goals, expert_actions)
         
         # Backward pass
         self.optimizer.zero_grad()
@@ -165,17 +170,21 @@ class VAEAgent:
         return loss_dict['loss'].item()
     
     def predict_next_action(self, state, action, goal, n_samples=10):
+        """Legacy method - redirects to predict_action."""
+        mean_pred, std_pred = self.predict_action(state, goal, n_samples)
+        return mean_pred, std_pred
+    
+    def predict_action(self, state, goal, n_samples=10):
         """
-        Predict next action with uncertainty estimation.
+        Predict action with uncertainty estimation.
         
         Args:
             state: Current state
-            action: Current action
             goal: Goal
             n_samples: Number of samples for uncertainty estimation
             
         Returns:
-            mean_prediction: Mean of predicted next actions
+            mean_prediction: Mean of predicted actions
             std_prediction: Standard deviation of predictions
         """
         self.encoder.eval()
@@ -183,19 +192,17 @@ class VAEAgent:
         
         # Prepare inputs
         state = torch.tensor(state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(action, dtype=torch.float32, device=self.device)
         goal = torch.tensor(goal, dtype=torch.float32, device=self.device)
         
         if state.ndim == 1:
             state = state.unsqueeze(0)
-            action = action.unsqueeze(0)
             goal = goal.unsqueeze(0)
         
         predictions = []
         
         with torch.no_grad():
             for _ in range(n_samples):
-                inputs = torch.cat([state, action, goal], dim=-1)
+                inputs = torch.cat([state, goal], dim=-1)
                 mu, logvar = self.encoder(inputs)
                 z = self.reparameterize(mu, logvar)
                 pred = self.decoder(z)
@@ -212,18 +219,17 @@ class VAEAgent:
         
         return mean_pred, std_pred
     
-    def validate(self, val_states, val_actions, val_goals, val_next_actions):
-        """Validate the model"""
+    def validate(self, val_states, val_actions, val_goals, val_expert_actions):
+        """Validate the model."""
         self.encoder.eval()
         self.decoder.eval()
         
         with torch.no_grad():
             states = torch.tensor(val_states, dtype=torch.float32, device=self.device)
-            actions = torch.tensor(val_actions, dtype=torch.float32, device=self.device)
             goals = torch.tensor(val_goals, dtype=torch.float32, device=self.device)
-            next_actions = torch.tensor(val_next_actions, dtype=torch.float32, device=self.device)
+            expert_actions = torch.tensor(val_expert_actions, dtype=torch.float32, device=self.device)
             
-            loss_dict = self.compute_loss(states, actions, goals, next_actions)
+            loss_dict = self.compute_loss(states, goals, expert_actions)
             
         return loss_dict['loss'].item()
     
@@ -238,16 +244,15 @@ class VAEAgent:
             
         return samples.detach().cpu().numpy()
     
-    def get_latent_representation(self, states, actions, goals):
+    def get_latent_representation(self, states, goals):
         """Get latent representation of inputs"""
         self.encoder.eval()
         
         with torch.no_grad():
             states = torch.tensor(states, dtype=torch.float32, device=self.device)
-            actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
             goals = torch.tensor(goals, dtype=torch.float32, device=self.device)
             
-            inputs = torch.cat([states, actions, goals], dim=-1)
+            inputs = torch.cat([states, goals], dim=-1)
             mu, logvar = self.encoder(inputs)
             
         return mu.detach().cpu().numpy(), logvar.detach().cpu().numpy()

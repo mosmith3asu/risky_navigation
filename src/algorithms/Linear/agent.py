@@ -16,10 +16,10 @@ class LinearModel(nn.Module):
         nn.init.xavier_uniform_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
     
-    def forward(self, state, action, goal):
-        x = torch.cat([state, action, goal], dim=-1)
-        next_action_pred = self.linear(x)
-        return next_action_pred
+    def forward(self, state_goal):
+        """For RL: input is state+goal, output is action."""
+        action_pred = self.linear(state_goal)
+        return action_pred
 
 class LinearAgent:
     def __init__(self, state_dim, action_dim, goal_dim, lr=1e-3, weight_decay=0.0, 
@@ -237,27 +237,28 @@ class LinearAgent:
         
         return train_losses, val_losses
     
-    def train_step(self, state, action, goal, next_action):
+    def train_step(self, state, action, goal, expert_action):
         """
-        Perform a single training step.
+        Perform a single training step for behavioral cloning.
         
         Args:
             state: Current state (batch)
-            action: Current action (batch)
+            action: Not used in RL mode (kept for compatibility)
             goal: Goal position (batch)
-            next_action: Next action to predict (batch)
+            expert_action: Expert action to imitate (batch)
             
         Returns:
             float: Loss value
         """
         self.model.train()
         state = torch.tensor(state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(action, dtype=torch.float32, device=self.device)
         goal = torch.tensor(goal, dtype=torch.float32, device=self.device)
-        next_action = torch.tensor(next_action, dtype=torch.float32, device=self.device)
+        expert_action = torch.tensor(expert_action, dtype=torch.float32, device=self.device)
         
-        pred = self.model(state, action, goal)
-        loss = self.loss_fn(pred, next_action)
+        # Concatenate state and goal
+        state_goal = torch.cat([state, goal], dim=-1)
+        pred = self.model(state_goal)
+        loss = self.loss_fn(pred, expert_action)
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -266,35 +267,38 @@ class LinearAgent:
         return loss.item()
     
     def predict_next_action(self, state, action, goal):
+        """Legacy method - redirects to predict_action."""
+        return self.predict_action(state, goal)
+    
+    def predict_action(self, state, goal):
         """
-        Predict the next action given current state, action and goal.
+        Predict action given current state and goal.
         
         Args:
             state: Current state
-            action: Current action
             goal: Goal position
             
         Returns:
-            numpy.ndarray: Predicted next action
+            numpy.ndarray: Predicted action
         """
         self.model.eval()
         with torch.no_grad():
             state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            action = torch.tensor(action, dtype=torch.float32, device=self.device).unsqueeze(0)
             goal = torch.tensor(goal, dtype=torch.float32, device=self.device).unsqueeze(0)
             
-            pred = self.model(state, action, goal)
+            state_goal = torch.cat([state, goal], dim=-1)
+            pred = self.model(state_goal)
             return pred.cpu().numpy().squeeze(0)
     
-    def validate(self, states, actions, goals, next_actions):
+    def validate(self, states, actions, goals, expert_actions):
         """
         Validate the model on a validation set.
         
         Args:
             states: Batch of states
-            actions: Batch of actions
+            actions: Not used in RL mode
             goals: Batch of goals
-            next_actions: Batch of next actions to predict
+            expert_actions: Batch of expert actions to predict
             
         Returns:
             float: Validation loss
@@ -302,12 +306,12 @@ class LinearAgent:
         self.model.eval()
         with torch.no_grad():
             states = torch.tensor(states, dtype=torch.float32, device=self.device)
-            actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
             goals = torch.tensor(goals, dtype=torch.float32, device=self.device)
-            next_actions = torch.tensor(next_actions, dtype=torch.float32, device=self.device)
+            expert_actions = torch.tensor(expert_actions, dtype=torch.float32, device=self.device)
             
-            preds = self.model(states, actions, goals)
-            val_loss = self.loss_fn(preds, next_actions).item()
+            state_goal = torch.cat([states, goals], dim=-1)
+            preds = self.model(state_goal)
+            val_loss = self.loss_fn(preds, expert_actions).item()
             
             return val_loss
     
