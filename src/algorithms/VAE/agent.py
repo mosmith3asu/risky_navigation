@@ -84,8 +84,11 @@ class VAEAgent:
         self.optimizer_type = optimizer_type
         self.device = device
         
-        # Input is state + current_action + goal, output is next_action
-        input_dim = state_dim + action_dim + goal_dim
+        # For RL: if goal_dim is 0, state_dim already includes goal
+        if goal_dim == 0:
+            input_dim = state_dim  # Already includes goal for RL
+        else:
+            input_dim = state_dim + action_dim + goal_dim  # Supervised mode
         output_dim = action_dim
         
         # Initialize encoder and decoder
@@ -320,7 +323,11 @@ class VAEAgent:
                 self.hidden_dim = param_dict['hidden_dim']
             
             # Recreate model with new architecture
-            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            # Calculate input_dim based on mode
+            if self.goal_dim == 0:
+                input_dim = self.state_dim  # RL mode
+            else:
+                input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
             output_dim = self.action_dim
             self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
             self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
@@ -356,7 +363,11 @@ class VAEAgent:
             if 'hidden_dim' in best_params:
                 self.hidden_dim = best_params['hidden_dim']
             
-            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            # Calculate input_dim based on mode
+            if self.goal_dim == 0:
+                input_dim = self.state_dim  # RL mode
+            else:
+                input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
             output_dim = self.action_dim
             self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
             self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
@@ -411,7 +422,11 @@ class VAEAgent:
             self.latent_dim = latent_dim
             self.hidden_dim = hidden_dim
             
-            input_dim = self.state_dim + self.action_dim + self.goal_dim
+            # Calculate input_dim based on mode
+            if self.goal_dim == 0:
+                input_dim = self.state_dim  # RL mode
+            else:
+                input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
             output_dim = self.action_dim
             self.encoder = VAEEncoder(input_dim, latent_dim, hidden_dim).to(self.device)
             self.decoder = VAEDecoder(latent_dim, output_dim, hidden_dim).to(self.device)
@@ -432,7 +447,11 @@ class VAEAgent:
         self.latent_dim = best_params['latent_dim']
         self.hidden_dim = best_params['hidden_dim']
         
-        input_dim = self.state_dim + self.action_dim + self.goal_dim
+        # Calculate input_dim based on mode
+        if self.goal_dim == 0:
+            input_dim = self.state_dim  # RL mode
+        else:
+            input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
         output_dim = self.action_dim
         self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
         self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)
@@ -550,7 +569,11 @@ class VAEAgent:
     
     def _reset_model(self):
         """Reset model to initial state."""
-        input_dim = self.state_dim + self.action_dim + self.goal_dim
+        # Calculate input_dim based on mode
+        if self.goal_dim == 0:
+            input_dim = self.state_dim  # RL mode
+        else:
+            input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
         output_dim = self.action_dim
         self.encoder = VAEEncoder(input_dim, self.latent_dim, self.hidden_dim).to(self.device)
         self.decoder = VAEDecoder(self.latent_dim, output_dim, self.hidden_dim).to(self.device)

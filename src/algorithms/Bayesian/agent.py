@@ -50,10 +50,10 @@ class BayesianLinear(nn.Module):
 
 
 class BayesianEncoder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
+    def __init__(self, input_dim, latent_dim, prior_std=1.0):
         super().__init__()
-        self.fc1 = BayesianLinear(input_dim, latent_dim * 2)
-        self.fc2 = BayesianLinear(latent_dim * 2, latent_dim)
+        self.fc1 = BayesianLinear(input_dim, latent_dim * 2, prior_std)
+        self.fc2 = BayesianLinear(latent_dim * 2, latent_dim, prior_std)
     
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -70,10 +70,10 @@ class BayesianEncoder(nn.Module):
 
 
 class BayesianDecoder(nn.Module):
-    def __init__(self, latent_dim, output_dim):
+    def __init__(self, latent_dim, output_dim, prior_std=1.0):
         super().__init__()
-        self.fc1 = BayesianLinear(latent_dim, latent_dim * 2)
-        self.fc2 = BayesianLinear(latent_dim * 2, output_dim)
+        self.fc1 = BayesianLinear(latent_dim, latent_dim * 2, prior_std)
+        self.fc2 = BayesianLinear(latent_dim * 2, output_dim, prior_std)
         
         # Learn the log variance of the output distribution
         self.log_var = nn.Parameter(torch.zeros(output_dim))
@@ -105,11 +105,15 @@ class BayesianAgent:
         self.lr = lr
         self.prior_std = prior_std
         
-        input_dim = state_dim + action_dim + goal_dim
+        # For RL: if goal_dim is 0, state_dim already includes goal
+        if goal_dim == 0:
+            input_dim = state_dim  # Already includes goal for RL
+        else:
+            input_dim = state_dim + action_dim + goal_dim  # Supervised mode
         
         # Initialize encoder and decoder
-        self.encoder = BayesianEncoder(input_dim, latent_dim).to(self.device)
-        self.decoder = BayesianDecoder(latent_dim, action_dim).to(self.device)
+        self.encoder = BayesianEncoder(input_dim, latent_dim, prior_std).to(self.device)
+        self.decoder = BayesianDecoder(latent_dim, action_dim, prior_std).to(self.device)
         
         # KL divergence weight (beta) for the ELBO loss
         self.kl_weight = kl_weight
@@ -279,9 +283,13 @@ class BayesianAgent:
             # Update parameters
             if 'latent_dim' in param_dict:
                 self.latent_dim = param_dict['latent_dim']
-                input_dim = self.state_dim + self.action_dim + self.goal_dim
-                self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
-                self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+                # Calculate input_dim based on mode
+                if self.goal_dim == 0:
+                    input_dim = self.state_dim  # RL mode
+                else:
+                    input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+                self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
+                self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
             
             # Update other hyperparameters
             self.update_hyperparameters(**{k: v for k, v in param_dict.items() 
@@ -311,9 +319,13 @@ class BayesianAgent:
             # Reset with best architecture
             if 'latent_dim' in best_params:
                 self.latent_dim = best_params['latent_dim']
-                input_dim = self.state_dim + self.action_dim + self.goal_dim
-                self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
-                self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+                # Calculate input_dim based on mode
+                if self.goal_dim == 0:
+                    input_dim = self.state_dim  # RL mode
+                else:
+                    input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+                self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
+                self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
             
             self.encoder.load_state_dict(self.best_state_dict['encoder'])
             self.decoder.load_state_dict(self.best_state_dict['decoder'])
@@ -361,9 +373,13 @@ class BayesianAgent:
             
             # Reset model with new parameters
             self.latent_dim = latent_dim
-            input_dim = self.state_dim + self.action_dim + self.goal_dim
-            self.encoder = BayesianEncoder(input_dim, latent_dim).to(self.device)
-            self.decoder = BayesianDecoder(latent_dim, self.action_dim).to(self.device)
+            # Calculate input_dim based on mode
+            if self.goal_dim == 0:
+                input_dim = self.state_dim  # RL mode
+            else:
+                input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+            self.encoder = BayesianEncoder(input_dim, latent_dim, prior_std).to(self.device)
+            self.decoder = BayesianDecoder(latent_dim, self.action_dim, prior_std).to(self.device)
             
             self.update_hyperparameters(lr=lr, kl_weight=kl_weight, prior_std=prior_std)
             
@@ -378,9 +394,13 @@ class BayesianAgent:
         # Apply best parameters
         best_params = study.best_params
         self.latent_dim = best_params['latent_dim']
-        input_dim = self.state_dim + self.action_dim + self.goal_dim
-        self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
-        self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+        # Calculate input_dim based on mode
+        if self.goal_dim == 0:
+            input_dim = self.state_dim  # RL mode
+        else:
+            input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+        self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
+        self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
         
         self.update_hyperparameters(
             lr=best_params['lr'],
@@ -494,9 +514,13 @@ class BayesianAgent:
     
     def _reset_model(self):
         """Reset model to initial state."""
-        input_dim = self.state_dim + self.action_dim + self.goal_dim
-        self.encoder = BayesianEncoder(input_dim, self.latent_dim).to(self.device)
-        self.decoder = BayesianDecoder(self.latent_dim, self.action_dim).to(self.device)
+        # Calculate input_dim based on mode
+        if self.goal_dim == 0:
+            input_dim = self.state_dim  # RL mode
+        else:
+            input_dim = self.state_dim + self.action_dim + self.goal_dim  # Supervised mode
+        self.encoder = BayesianEncoder(input_dim, self.latent_dim, self.prior_std).to(self.device)
+        self.decoder = BayesianDecoder(self.latent_dim, self.action_dim, self.prior_std).to(self.device)
     
     def _train_epochs(self, train_data, val_data, num_epochs, scheduler=None):
         """Internal method to train for specified epochs."""

@@ -37,11 +37,17 @@ class TransformerModel(nn.Module):
         self.action_dim = action_dim
         self.goal_dim = goal_dim
         self.d_model = d_model
+        self.rl_mode = (goal_dim == 0)  # RL mode if goal_dim is 0
         
         # Input embeddings
-        self.state_embedding = nn.Linear(state_dim, d_model)
-        self.action_embedding = nn.Linear(action_dim, d_model)
-        self.goal_embedding = nn.Linear(goal_dim, d_model)
+        if self.rl_mode:
+            # For RL: state_dim already includes goal, no action embedding needed
+            self.state_goal_embedding = nn.Linear(state_dim, d_model)
+        else:
+            # For supervised: separate embeddings
+            self.state_embedding = nn.Linear(state_dim, d_model)
+            self.action_embedding = nn.Linear(action_dim, d_model)
+            self.goal_embedding = nn.Linear(goal_dim, d_model)
         
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model)
@@ -54,31 +60,37 @@ class TransformerModel(nn.Module):
         # Output head
         self.output_layer = nn.Linear(d_model, action_dim)
         
-    def forward(self, state, goal):
+    def forward(self, state, goal=None):
         """
-        Forward pass for RL: input is state+goal, output is action.
+        Forward pass for both RL and supervised modes.
+        
+        RL mode (goal=None): state contains state+goal concatenated
+        Supervised mode (goal provided): state, goal are separate
         
         Args:
-            state: [batch_size, state_dim]
-            goal: [batch_size, goal_dim]
+            state: [batch_size, state_dim] (RL) or [batch_size, state_dim] (supervised)
+            goal: [batch_size, goal_dim] or None
             
         Returns:
             action_pred: [batch_size, action_dim]
         """
         batch_size = state.shape[0]
         
-        # Create embeddings for state and goal only
-        state_emb = self.state_embedding(state).unsqueeze(1)  # [batch_size, 1, d_model]
-        goal_emb = self.goal_embedding(goal).unsqueeze(1)  # [batch_size, 1, d_model]
-        
-        # Concatenate embeddings to form a sequence
-        sequence = torch.cat([state_emb, goal_emb], dim=1)  # [batch_size, 2, d_model]
+        if self.rl_mode or goal is None:
+            # RL mode: state already includes goal
+            state_goal_emb = self.state_goal_embedding(state).unsqueeze(1)  # [batch_size, 1, d_model]
+            sequence = state_goal_emb
+        else:
+            # Supervised mode: separate state and goal
+            state_emb = self.state_embedding(state).unsqueeze(1)  # [batch_size, 1, d_model]
+            goal_emb = self.goal_embedding(goal).unsqueeze(1)  # [batch_size, 1, d_model]
+            sequence = torch.cat([state_emb, goal_emb], dim=1)  # [batch_size, 2, d_model]
         
         # Add positional encoding
         sequence = self.pos_encoder(sequence)
         
         # Apply transformer encoder
-        output = self.transformer_encoder(sequence)  # [batch_size, 2, d_model]
+        output = self.transformer_encoder(sequence)  # [batch_size, seq_len, d_model]
         
         # Use the mean across tokens to capture all information
         output = output.mean(dim=1)  # [batch_size, d_model]
