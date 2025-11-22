@@ -1,2 +1,0 @@
-algorithm,train_time,test_time,final_train_loss,final_val_loss,avg_mse,avg_reward,success_rate,model_params,best_hyperparams,hp_search_cv_score,best_hyperparams_str
-VAE,143.04401683807373,47.803993940353394,0.21820347684703462,0.21434347331523895,0.21575959,-56.98450391858602,0.0,279586,"{'beta': 2.0, 'hidden_dim': 256, 'latent_dim': 16, 'lr': 0.01}",0.21815477311611176,"{'beta': 2.0, 'hidden_dim': 256, 'latent_dim': 16, 'lr': 0.01}"
