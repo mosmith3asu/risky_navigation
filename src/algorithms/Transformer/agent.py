@@ -17,9 +17,9 @@ class TransformerModel(nn.Module):
         return x
 
 class TransformerAgent:
-    def __init__(self, state_dim, action_dim, goal_dim, d_model=64, nhead=4, num_layers=2, dropout=0.1, lr=1e-3, device=None):
+    def __init__(self, state_dim, action_dim, goal_dim=None, d_model=64, nhead=4, num_layers=2, dropout=0.1, lr=1e-3, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        input_dim = state_dim + goal_dim
+        input_dim = state_dim  # State only
         self.model = TransformerModel(input_dim, action_dim, d_model, nhead, num_layers, dropout).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
@@ -27,22 +27,19 @@ class TransformerAgent:
     def train_step(self, states, actions, goals, expert_actions):
         self.model.train()
         self.optimizer.zero_grad()
-        inputs = torch.cat([states, goals], dim=-1)
-        predictions = self.model(inputs)
+        predictions = self.model(states)  # State only
         loss = self.loss_fn(predictions, expert_actions)
         loss.backward()
         self.optimizer.step()
         return loss.item()
     
-    def predict_action(self, state, goal):
+    def predict_action(self, state, goal=None):
         self.model.eval()
         with torch.no_grad():
             if state.ndim == 1:
                 state = state.unsqueeze(0)
-                goal = goal.unsqueeze(0)
                 squeeze = True
             else:
                 squeeze = False
-            inputs = torch.cat([state, goal], dim=-1)
-            action = self.model(inputs)
+            action = self.model(state)
             return action.squeeze(0) if squeeze else action

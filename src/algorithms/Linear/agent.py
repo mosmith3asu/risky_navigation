@@ -11,9 +11,10 @@ class LinearModel(nn.Module):
         return self.linear(x)
 
 class LinearAgent:
-    def __init__(self, state_dim, action_dim, goal_dim, lr=1e-3, device=None):
+    def __init__(self, state_dim, action_dim, goal_dim=None, lr=1e-3, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        input_dim = state_dim + goal_dim
+        # Use only state_dim (goal info is in state[4:6])
+        input_dim = state_dim
         self.model = LinearModel(input_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
@@ -21,22 +22,21 @@ class LinearAgent:
     def train_step(self, states, actions, goals, expert_actions):
         self.model.train()
         self.optimizer.zero_grad()
-        inputs = torch.cat([states, goals], dim=-1)
-        predictions = self.model(inputs)
+        # Use state only (no goal concatenation)
+        predictions = self.model(states)
         loss = self.loss_fn(predictions, expert_actions)
         loss.backward()
         self.optimizer.step()
         return loss.item()
     
-    def predict_action(self, state, goal):
+    def predict_action(self, state, goal=None):
+        # goal parameter kept for API compatibility but not used
         self.model.eval()
         with torch.no_grad():
             if state.ndim == 1:
                 state = state.unsqueeze(0)
-                goal = goal.unsqueeze(0)
                 squeeze = True
             else:
                 squeeze = False
-            inputs = torch.cat([state, goal], dim=-1)
-            action = self.model(inputs)
+            action = self.model(state)
             return action.squeeze(0) if squeeze else action

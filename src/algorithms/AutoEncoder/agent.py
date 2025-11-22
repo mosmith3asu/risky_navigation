@@ -44,12 +44,12 @@ class AutoEncoder(nn.Module):
 
 class AutoEncoderAgent:
     """AutoEncoder agent for behavioral cloning"""
-    def __init__(self, state_dim, action_dim, goal_dim, latent_dim=64, hidden_dims=None,
+    def __init__(self, state_dim, action_dim, goal_dim=None, latent_dim=64, hidden_dims=None,
                  activation='ReLU', dropout=0.0, batch_norm=False, lr=1e-3, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Input is state+goal concatenated
-        input_dim = state_dim + goal_dim
+        # Use state only (goal info is in state[4:6])
+        input_dim = state_dim
         
         self.model = AutoEncoder(
             input_dim, action_dim, latent_dim, hidden_dims,
@@ -60,19 +60,18 @@ class AutoEncoderAgent:
         self.loss_fn = nn.MSELoss()
     
     def train_step(self, states, actions, goals, expert_actions):
-        """Train step: predict expert actions from states+goals.
+        """Train step: predict expert actions from states only.
         Args:
             states: [batch, state_dim]
             actions: Ignored (for compatibility)
-            goals: [batch, goal_dim]
+            goals: Ignored (goal info in state[4:6])
             expert_actions: [batch, action_dim] - target actions
         """
         self.model.train()
         self.optimizer.zero_grad()
         
-        # Concatenate state + goal as input
-        inputs = torch.cat([states, goals], dim=-1)
-        predictions = self.model(inputs)
+        # Use state only
+        predictions = self.model(states)
         loss = self.loss_fn(predictions, expert_actions)
         
         loss.backward()
@@ -80,11 +79,11 @@ class AutoEncoderAgent:
         
         return loss.item()
     
-    def predict_action(self, state, goal):
-        """Predict action from state and goal.
+    def predict_action(self, state, goal=None):
+        """Predict action from state only.
         Args:
             state: [state_dim] or [batch, state_dim]
-            goal: [goal_dim] or [batch, goal_dim]
+            goal: Ignored (kept for API compatibility)
         Returns:
             action: [action_dim] or [batch, action_dim]
         """
@@ -93,12 +92,10 @@ class AutoEncoderAgent:
             # Handle single sample
             if state.ndim == 1:
                 state = state.unsqueeze(0)
-                goal = goal.unsqueeze(0)
                 squeeze = True
             else:
                 squeeze = False
             
-            inputs = torch.cat([state, goal], dim=-1)
-            action = self.model(inputs)
+            action = self.model(state)
             
             return action.squeeze(0) if squeeze else action
