@@ -1,30 +1,40 @@
-# Linear Regression for Action Prediction
+# Linear Regression for Temporal Action Prediction
 
 Simple linear baseline for temporal action prediction in teleoperation with communication delays.
 
 ## Problem
 
-Predict operator actions to compensate for communication delays:
-- **Input**: Current state, previous action, goal
-- **Output**: Current action prediction
-- **Use case**: Robot predicts delayed human action to continue safe navigation
+Predict operator actions using temporal history to compensate for communication delays:
+- **Input**: State sequence, action sequence, goal
+- **Output**: Next action prediction
+- **Use case**: Robot predicts delayed human action using temporal patterns
 
 ## Technical Workflow
 
 ### Input
-- **State Vector**: Position, velocity, heading, obstacle distances
-- **Previous Action**: Action from previous timestep (autoregressive)
+- **State Sequence**: History of states `[state_{t-n}, ..., state_t]`
+  - Each state: Position, velocity, heading, obstacle distances
+- **Action Sequence**: History of actions `[action_{t-n}, ..., action_{t-1}]`
 - **Goal Vector**: Target position
+- **sequence_len**: Controls temporal history length
+  - `sequence_len=1`: Single previous state/action (baseline)
+  - `sequence_len>1`: Temporal sequences for history-based prediction
 
 ### Processing
 ```python
-action_t = W * [state_t, action_{t-1}, goal] + b
+# Flatten sequences into single vector
+state_flat = state_sequence.reshape(batch, -1)  # (batch, seq_len*state_dim)
+action_flat = action_sequence.reshape(batch, -1)  # (batch, seq_len*action_dim)
+input = concat([state_flat, action_flat, goal])  # (batch, seq_len*(state+action)+goal)
+
+action_t = W * input + b
 ```
 
-Single linear layer maps concatenated input to action space.
+Single linear layer maps flattened temporal context to action space.
 
 ### Training
 - **Data**: Expert demonstrations from visibility graph optimal policy
+- **Sequences**: Created using sliding window over episodes
 - **Loss**: MSE between predicted and expert actions
 
 ### Output
@@ -45,6 +55,10 @@ class LinearModel(nn.Module):
 
 ## Hyperparameters
 
+- `sequence_len`: Temporal history length ⚠️ **Critical** (default: 5)
+  - Controls how many previous (state, action) pairs are used
+  - `sequence_len=1`: No temporal modeling
+  - `sequence_len>1`: Temporal sequence modeling
 - `lr`: Learning rate (default: 1e-3)
 - `batch_size`: Batch size for training (default: 128)
 - `num_epochs`: Number of training epochs (default: 20)

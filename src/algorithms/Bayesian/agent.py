@@ -99,7 +99,7 @@ class BayesianAgent:
                 
                 kl_loss += weight_kl + bias_kl
         
-        kl_loss = kl_loss / states.size(0)
+        kl_loss = kl_loss / state_sequences.size(0)
         loss = likelihood_loss + self.kl_weight * kl_loss
         
         loss.backward()

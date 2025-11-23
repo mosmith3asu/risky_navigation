@@ -105,16 +105,6 @@ class VAEAgent:
             action = self.decoder(mu)
             action = torch.clamp(action, self.action_low, self.action_high)
             return action.squeeze(0) if squeeze else action
-                prev_action = prev_action.unsqueeze(0) if prev_action.ndim == 1 else prev_action
-                goal = goal.unsqueeze(0) if goal.ndim == 1 else goal
-                squeeze = True
-            else:
-                squeeze = False
-            inputs = torch.cat([state, prev_action, goal], dim=1)
-            mu, _ = self.encoder(inputs)
-            action = self.decoder(mu)
-            action = torch.clamp(action, self.action_low, self.action_high)
-            return action.squeeze(0) if squeeze else action
     
     def save(self, filepath):
         """Save encoder, decoder weights and action bounds."""

@@ -10,7 +10,7 @@ from src.utils.file_management import save_pickle, load_pickle
 from src.utils.logger import Logger
 from src.utils.visibility_graph import VisibilityGraph
 
-def collect_expert_data(env, vgraph, num_episodes=100, max_steps=200):
+def collect_expert_data(env, vgraph, num_episodes=100, max_steps=200, sequence_len=1):
     """
     Collect expert demonstration data using visibility graph policy.
     
@@ -19,15 +19,17 @@ def collect_expert_data(env, vgraph, num_episodes=100, max_steps=200):
         vgraph: VisibilityGraph instance for optimal navigation
         num_episodes: Number of episodes to collect
         max_steps: Maximum steps per episode
+        sequence_len: Length of temporal sequences (1 = no history)
         
     Returns:
-        list: Transitions with state, prev_action, expert_action, goal
+        list: Transitions with state_sequences, action_sequences, expert_action, goal
     """
-    data = []
+    episodes = []
     for ep in trange(num_episodes, desc='Collecting expert data'):
         state = env.reset()
         goal = env.goal.copy()
         prev_action = np.zeros(env.action_space.shape[0])
+        episode_data = []
         
         for t in range(max_steps):
             current_pos = state[:2]
@@ -57,11 +59,9 @@ def collect_expert_data(env, vgraph, num_episodes=100, max_steps=200):
             
             next_state, reward, done, info = env.step(action)
             
-            data.append({
+            episode_data.append({
                 'state': state.copy(),
-                'prev_action': prev_action.copy(),
                 'action': action.copy(),
-                'goal': goal.copy(),
             })
             
             prev_action = action
@@ -69,6 +69,36 @@ def collect_expert_data(env, vgraph, num_episodes=100, max_steps=200):
             
             if done:
                 break
+        
+        if len(episode_data) > 0:
+            episodes.append({'transitions': episode_data, 'goal': goal})
+    
+    # Create sequences from episodes
+    data = []
+    for episode in episodes:
+        transitions = episode['transitions']
+        goal = episode['goal']
+        
+        for i in range(len(transitions)):
+            # Get sequence history
+            start_idx = max(0, i - sequence_len + 1)
+            seq_transitions = transitions[start_idx:i+1]
+            
+            # Pad if necessary
+            while len(seq_transitions) < sequence_len:
+                seq_transitions.insert(0, {'state': np.zeros_like(transitions[0]['state']), 
+                                           'action': np.zeros_like(transitions[0]['action'])})
+            
+            state_seq = np.array([t['state'] for t in seq_transitions[:-1]] + [transitions[i]['state']])
+            action_seq = np.array([t['action'] for t in seq_transitions[:-1]] + [np.zeros_like(transitions[i]['action'])])
+            target_action = transitions[i]['action']
+            
+            data.append({
+                'state_sequences': state_seq,
+                'action_sequences': action_seq,
+                'target_action': target_action,
+                'goal': goal,
+            })
     
     return data
 
@@ -77,49 +107,49 @@ def prepare_arrays(data):
     Convert data list to numpy arrays.
     
     Args:
-        data: List of dictionaries with state, prev_action, action, goal
+        data: List of dictionaries with state_sequences, action_sequences, target_action, goal
         
     Returns:
-        tuple: Arrays of states, prev_actions, actions, goals
+        tuple: Arrays of state_sequences, action_sequences, target_actions, goals
     """
-    states = np.stack([d['state'] for d in data])
-    prev_actions = np.stack([d['prev_action'] for d in data])
-    actions = np.stack([d['action'] for d in data])
+    state_sequences = np.stack([d['state_sequences'] for d in data])
+    action_sequences = np.stack([d['action_sequences'] for d in data])
+    target_actions = np.stack([d['target_action'] for d in data])
     goals = np.stack([d['goal'] for d in data])
-    return states, prev_actions, actions, goals
+    return state_sequences, action_sequences, target_actions, goals
 
-def split_data(states, prev_actions, actions, goals, val_ratio=0.2):
+def split_data(state_sequences, action_sequences, target_actions, goals, val_ratio=0.2):
     """
     Split data into training and validation sets.
     
     Args:
-        states: Array of states
-        prev_actions: Array of previous actions
-        actions: Array of expert actions
+        state_sequences: Array of state sequences
+        action_sequences: Array of action sequences
+        target_actions: Array of target actions
         goals: Array of goals
         val_ratio: Validation set ratio
         
     Returns:
         tuple: Training and validation data arrays
     """
-    n = states.shape[0]
+    n = state_sequences.shape[0]
     indices = np.random.permutation(n)
     val_size = int(n * val_ratio)
     val_indices = indices[:val_size]
     train_indices = indices[val_size:]
     
-    train_states = states[train_indices]
-    train_prev_actions = prev_actions[train_indices]
-    train_actions = actions[train_indices]
+    train_state_seqs = state_sequences[train_indices]
+    train_action_seqs = action_sequences[train_indices]
+    train_target_actions = target_actions[train_indices]
     train_goals = goals[train_indices]
     
-    val_states = states[val_indices]
-    val_prev_actions = prev_actions[val_indices]
-    val_actions = actions[val_indices]
+    val_state_seqs = state_sequences[val_indices]
+    val_action_seqs = action_sequences[val_indices]
+    val_target_actions = target_actions[val_indices]
     val_goals = goals[val_indices]
     
-    return (train_states, train_prev_actions, train_actions, train_goals), \
-           (val_states, val_prev_actions, val_actions, val_goals)
+    return (train_state_seqs, train_action_seqs, train_target_actions, train_goals), \
+           (val_state_seqs, val_action_seqs, val_target_actions, val_goals)
 
 def plot_losses(train_losses, val_losses, save_path=None):
     """
@@ -145,12 +175,13 @@ def plot_losses(train_losses, val_losses, save_path=None):
 def main():
     num_episodes = 200
     max_steps = 200
+    sequence_len = 5  # Temporal history length
     lr = 1e-3
     batch_size = 128
     num_epochs = 20
     val_ratio = 0.2
-    dataset_path = 'linear_expert_dataset.pickle'
-    model_path = 'linear_model.pth'
+    dataset_path = f'linear_expert_dataset_seq{sequence_len}.pickle'
+    model_path = f'linear_model_seq{sequence_len}.pth'
     
     layout_dict = read_layout_dict('example0')
     env = ContinuousNavigationEnv(**layout_dict)
@@ -162,34 +193,35 @@ def main():
         print(f"Loading dataset from {dataset_path}")
         data = load_pickle(dataset_path)
     else:
-        print(f"Collecting expert data from {num_episodes} episodes")
-        data = collect_expert_data(env, vgraph, num_episodes, max_steps)
+        print(f"Collecting expert data from {num_episodes} episodes with sequence_len={sequence_len}")
+        data = collect_expert_data(env, vgraph, num_episodes, max_steps, sequence_len)
         save_pickle(data, dataset_path)
         print(f"Dataset saved to {dataset_path}")
     
-    states, prev_actions, actions, goals = prepare_arrays(data)
-    (train_states, train_prev_actions, train_actions, train_goals), \
-    (val_states, val_prev_actions, val_actions, val_goals) = \
-        split_data(states, prev_actions, actions, goals, val_ratio)
+    state_sequences, action_sequences, target_actions, goals = prepare_arrays(data)
+    (train_state_seqs, train_action_seqs, train_target_actions, train_goals), \
+    (val_state_seqs, val_action_seqs, val_target_actions, val_goals) = \
+        split_data(state_sequences, action_sequences, target_actions, goals, val_ratio)
     
-    print(f"Training set size: {len(train_states)}, Validation set size: {len(val_states)}")
+    print(f"Training set size: {len(train_state_seqs)}, Validation set size: {len(val_state_seqs)}")
+    print(f"Sequence shape: {train_state_seqs.shape}")
     
-    state_dim = states.shape[1]
-    action_dim = actions.shape[1]
+    state_dim = state_sequences.shape[2]  # (batch, seq_len, state_dim)
+    action_dim = target_actions.shape[1]
     goal_dim = goals.shape[1]
-    agent = LinearAgent(state_dim, action_dim, goal_dim, lr=lr, 
+    agent = LinearAgent(state_dim, action_dim, goal_dim, sequence_len=sequence_len, lr=lr, 
                        action_low=env.action_space.low, action_high=env.action_space.high)
     
     train_losses = []
     val_losses = []
-    num_batches = len(train_states) // batch_size
+    num_batches = len(train_state_seqs) // batch_size
     
     print(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
-        indices = np.random.permutation(len(train_states))
-        train_states_shuffled = train_states[indices]
-        train_prev_actions_shuffled = train_prev_actions[indices]
-        train_actions_shuffled = train_actions[indices]
+        indices = np.random.permutation(len(train_state_seqs))
+        train_state_seqs_shuffled = train_state_seqs[indices]
+        train_action_seqs_shuffled = train_action_seqs[indices]
+        train_target_actions_shuffled = train_target_actions[indices]
         train_goals_shuffled = train_goals[indices]
         
         epoch_loss = 0.0
@@ -197,12 +229,12 @@ def main():
             start_idx = batch_idx * batch_size
             end_idx = start_idx + batch_size
             
-            batch_states = train_states_shuffled[start_idx:end_idx]
-            batch_prev_actions = train_prev_actions_shuffled[start_idx:end_idx]
-            batch_actions = train_actions_shuffled[start_idx:end_idx]
+            batch_state_seqs = train_state_seqs_shuffled[start_idx:end_idx]
+            batch_action_seqs = train_action_seqs_shuffled[start_idx:end_idx]
+            batch_target_actions = train_target_actions_shuffled[start_idx:end_idx]
             batch_goals = train_goals_shuffled[start_idx:end_idx]
             
-            loss = agent.train_step(batch_states, batch_prev_actions, batch_goals, batch_actions)
+            loss = agent.train_step(batch_state_seqs, batch_action_seqs, batch_goals, batch_target_actions)
             epoch_loss += loss
         
         avg_train_loss = epoch_loss / num_batches
@@ -210,13 +242,18 @@ def main():
         
         with torch.no_grad():
             agent.model.eval()
-            val_states_t = torch.tensor(val_states, dtype=torch.float32, device=agent.device)
-            val_prev_actions_t = torch.tensor(val_prev_actions, dtype=torch.float32, device=agent.device)
-            val_actions_t = torch.tensor(val_actions, dtype=torch.float32, device=agent.device)
+            val_state_seqs_t = torch.tensor(val_state_seqs, dtype=torch.float32, device=agent.device)
+            val_action_seqs_t = torch.tensor(val_action_seqs, dtype=torch.float32, device=agent.device)
+            val_target_actions_t = torch.tensor(val_target_actions, dtype=torch.float32, device=agent.device)
             val_goals_t = torch.tensor(val_goals, dtype=torch.float32, device=agent.device)
-            inputs = torch.cat([val_states_t, val_prev_actions_t, val_goals_t], dim=1)
+            
+            batch_size = val_state_seqs_t.shape[0]
+            state_seq_flat = val_state_seqs_t.reshape(batch_size, -1)
+            action_seq_flat = val_action_seqs_t.reshape(batch_size, -1)
+            inputs = torch.cat([state_seq_flat, action_seq_flat, val_goals_t], dim=1)
+            
             predictions = agent.model(inputs)
-            val_loss = agent.loss_fn(predictions, val_actions_t).item()
+            val_loss = agent.loss_fn(predictions, val_target_actions_t).item()
             agent.model.train()
         val_losses.append(val_loss)
         

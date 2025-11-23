@@ -5,39 +5,56 @@ Transformer model for temporal action prediction using self-attention over actio
 ## Problem
 
 Predict operator actions using temporal patterns from action history:
-- **Input**: Current state, previous action(s), goal
+- **Input**: State sequence, action sequence, goal
 - **Output**: Action prediction based on temporal context
 - **Use case**: Capture temporal dependencies in human control patterns
 
 ## Technical Workflow
 
 ### Input
-- **State Vector**: Position, velocity, heading, obstacle distances
-- **Previous Action(s)**: Recent action history (sequence_len determines history length)
-- **Goal Vector**: Target position
+- **State Sequence**: History of states `[state_{t-n}, ..., state_t]`
+  - Each state: Position, velocity, heading, obstacle distances
+- **Action Sequence**: History of actions `[action_{t-n}, ..., action_{t-1}]`
+- **Goal Vector**: Target position (replicated across sequence)
+- **sequence_len**: Controls temporal context ⚠️ **Critical for Transformer**
+  - `sequence_len=1`: No temporal modeling (falls back to feedforward)
+  - `sequence_len>1`: True self-attention over temporal sequences
 
 ### Processing
 ```python
-# Embed inputs
-x = embedding([state_t, action_{t-1}, goal])
-
-# Self-attention across time
-attention_output = transformer_encoder(x)
-
-# Predict action
-action_t = output_layer(attention_output)
+if sequence_len > 1:
+    # Concatenate state and action at each timestep
+    state_action = concat([state_sequence, action_sequence], dim=-1)
+    # Replicate goal across sequence
+    goal_expanded = goal.unsqueeze(1).expand(batch, seq_len, goal_dim)
+    inputs = concat([state_action, goal_expanded], dim=-1)
+    # Shape: (batch, seq_len, state_dim + action_dim + goal_dim)
+    
+    # Project to embedding space
+    x = input_projection(inputs)  # (batch, seq_len, d_model)
+    
+    # Self-attention across time
+    attention_output = transformer_encoder(x)  # (batch, seq_len, d_model)
+    
+    # Use last timestep for prediction
+    action_t = output_layer(attention_output[:, -1, :])  # (batch, action_dim)
+else:
+    # Fallback to feedforward network
+    inputs = concat([state, prev_action, goal])  # (batch, input_dim)
+    action_t = feedforward_network(inputs)  # (batch, action_dim)
 ```
 
-Transformer uses self-attention to weigh importance of different timesteps.
+Transformer uses self-attention to weigh importance of different timesteps in action history.
 
 ### Training
 - **Data**: Expert demonstrations from visibility graph
+- **Sequences**: Created using sliding window over episodes
 - **Loss**: MSE between predicted and expert actions
-- **sequence_len**: Controls temporal context (1=no history, >1=temporal modeling)
+- **Key**: sequence_len determines if true temporal modeling is used
 
 ### Output
 - **Action**: (throttle, steering) prediction
-- **Type**: Deterministic with temporal awareness
+- **Type**: Deterministic with temporal awareness via attention
 
 ## Model Architecture
 
