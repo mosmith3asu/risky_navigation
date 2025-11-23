@@ -15,7 +15,7 @@ Unlike deterministic models (like the AutoEncoder), Bayesian neural networks pro
 ## How it Works
 
 1. **Data Collection:**
-   - Similar to the AutoEncoder approach, we collect (state, action, goal, next_action) tuples.
+   - Similar to the AutoEncoder approach, we collect (state, action, goal, next_action) tuples. 
    
 2. **Bayesian Neural Network:**
    - Instead of regular neural network layers with fixed weights, we use Bayesian layers.

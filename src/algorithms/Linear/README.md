@@ -20,7 +20,7 @@ where:
 - `W` is a weight matrix
 - `b` is a bias vector
 - `[state, action, goal]` represents the concatenation of state, action, and goal vectors
-
+ 
 ### Advantages
 
 1. **Simplicity**: The linear model has a clear, interpretable structure.

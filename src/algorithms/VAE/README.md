@@ -32,7 +32,7 @@ Total Loss = Reconstruction Loss + β × KL Divergence
 
 Reconstruction Loss = MSE(predicted_action, ground_truth_action)
 KL Loss = -0.5 × Σ(1 + log(σ²) - μ² - σ²)
-```
+``` 
 
 ### Beta-VAE
 The β parameter controls the trade-off between reconstruction quality and latent space regularization:
