@@ -11,12 +11,13 @@ from src.utils.file_management import save_pickle, load_pickle
 from src.utils.logger import Logger
 from src.utils.visibility_graph import VisibilityGraph
 
-def collect_data(env, vgraph, num_episodes=100, max_steps=200):
-    data = []
+def collect_data(env, vgraph, num_episodes=100, max_steps=200, sequence_len=1):
+    episodes = []
     for ep in trange(num_episodes, desc='Collecting expert data'):
         state = env.reset()
         goal = env.goal.copy()
         prev_action = np.zeros(env.action_space.shape[0])
+        episode_data = []
         
         for t in range(max_steps):
             current_pos = state[:2]
@@ -46,11 +47,9 @@ def collect_data(env, vgraph, num_episodes=100, max_steps=200):
             
             next_state, reward, done, info = env.step(action)
             
-            data.append({
+            episode_data.append({
                 'state': state.copy(),
-                'prev_action': prev_action.copy(),
                 'action': action.copy(),
-                'goal': goal.copy(),
             })
             
             prev_action = action
@@ -58,15 +57,43 @@ def collect_data(env, vgraph, num_episodes=100, max_steps=200):
             
             if done:
                 break
+        
+        if len(episode_data) > 0:
+            episodes.append({'transitions': episode_data, 'goal': goal})
+    
+    # Create sequences from episodes
+    data = []
+    for episode in episodes:
+        transitions = episode['transitions']
+        goal = episode['goal']
+        
+        for i in range(len(transitions)):
+            start_idx = max(0, i - sequence_len + 1)
+            seq_transitions = transitions[start_idx:i+1]
+            
+            while len(seq_transitions) < sequence_len:
+                seq_transitions.insert(0, {'state': np.zeros_like(transitions[0]['state']), 
+                                           'action': np.zeros_like(transitions[0]['action'])})
+            
+            state_seq = np.array([t['state'] for t in seq_transitions[:-1]] + [transitions[i]['state']])
+            action_seq = np.array([t['action'] for t in seq_transitions[:-1]] + [np.zeros_like(transitions[i]['action'])])
+            target_action = transitions[i]['action']
+            
+            data.append({
+                'state_sequences': state_seq,
+                'action_sequences': action_seq,
+                'target_action': target_action,
+                'goal': goal,
+            })
     
     return data
 
 def prepare_arrays(data):
-    states = np.stack([d['state'] for d in data])
-    prev_actions = np.stack([d['prev_action'] for d in data])
-    actions = np.stack([d['action'] for d in data])
+    state_sequences = np.stack([d['state_sequences'] for d in data])
+    action_sequences = np.stack([d['action_sequences'] for d in data])
+    target_actions = np.stack([d['target_action'] for d in data])
     goals = np.stack([d['goal'] for d in data])
-    return states, prev_actions, actions, goals
+    return state_sequences, action_sequences, target_actions, goals
 
 def plot_losses(train_losses, val_losses):
     fig, ax = plt.subplots(1, 2, figsize=(12, 5))
@@ -83,14 +110,15 @@ def plot_losses(train_losses, val_losses):
 def main():
     num_episodes = 200
     max_steps = 200
+    sequence_len = 5
     hidden_dim = 128
     lr = 1e-3
     kl_weight = 1e-5
     batch_size = 128
     num_epochs = 20
     val_ratio = 0.2
-    dataset_path = 'bayesian_expert_dataset.pickle'
-    model_path = 'bayesian_model.pth'
+    dataset_path = f'bayesian_expert_dataset_seq{sequence_len}.pickle'
+    model_path = f'bayesian_model_seq{sequence_len}.pth'
 
     layout_dict = read_layout_dict('example0')
     env = ContinuousNavigationEnv(**layout_dict)
@@ -102,35 +130,36 @@ def main():
         data = load_pickle(dataset_path)
         print(f"Loaded dataset from {dataset_path}")
     else:
-        print("Collecting expert dataset...")
-        data = collect_data(env, vgraph, num_episodes=num_episodes, max_steps=max_steps)
+        print(f"Collecting expert dataset with sequence_len={sequence_len}...")
+        data = collect_data(env, vgraph, num_episodes=num_episodes, max_steps=max_steps, sequence_len=sequence_len)
         save_pickle(data, dataset_path)
         print(f"Saved dataset to {dataset_path}")
 
-    states, prev_actions, actions, goals = prepare_arrays(data)
-    state_dim = states.shape[1]
-    action_dim = actions.shape[1]
+    state_sequences, action_sequences, target_actions, goals = prepare_arrays(data)
+    state_dim = state_sequences.shape[2]
+    action_dim = target_actions.shape[1]
     goal_dim = goals.shape[1]
     
-    num_samples = states.shape[0]
+    num_samples = state_sequences.shape[0]
     num_train = int((1 - val_ratio) * num_samples)
     
     indices = np.random.permutation(num_samples)
     train_indices = indices[:num_train]
     val_indices = indices[num_train:]
     
-    train_states = states[train_indices]
-    train_prev_actions = prev_actions[train_indices]
-    train_actions = actions[train_indices]
+    train_state_seqs = state_sequences[train_indices]
+    train_action_seqs = action_sequences[train_indices]
+    train_target_actions = target_actions[train_indices]
     train_goals = goals[train_indices]
     
-    val_states = states[val_indices]
-    val_prev_actions = prev_actions[val_indices]
-    val_actions = actions[val_indices]
+    val_state_seqs = state_sequences[val_indices]
+    val_action_seqs = action_sequences[val_indices]
+    val_target_actions = target_actions[val_indices]
     val_goals = goals[val_indices]
 
     agent = BayesianAgent(
-        state_dim, action_dim, goal_dim, 
+        state_dim, action_dim, goal_dim,
+        sequence_len=sequence_len,
         hidden_dim=hidden_dim, 
         lr=lr,
         kl_weight=kl_weight,
@@ -144,19 +173,19 @@ def main():
     
     print("Starting training...")
     for epoch in range(num_epochs):
-        train_indices_shuffled = np.random.permutation(len(train_states))
+        train_indices_shuffled = np.random.permutation(len(train_state_seqs))
         epoch_loss = 0.0
-        num_batches = len(train_states) // batch_size
+        num_batches = len(train_state_seqs) // batch_size
         
         for i in range(0, len(train_indices_shuffled), batch_size):
             if i + batch_size > len(train_indices_shuffled):
                 break
             idx = train_indices_shuffled[i:i+batch_size]
             loss = agent.train_step(
-                train_states[idx], 
-                train_prev_actions[idx], 
+                train_state_seqs[idx], 
+                train_action_seqs[idx], 
                 train_goals[idx], 
-                train_actions[idx]
+                train_target_actions[idx]
             )
             epoch_loss += loss
         
@@ -165,13 +194,18 @@ def main():
         
         with torch.no_grad():
             agent.model.eval()
-            val_states_t = torch.tensor(val_states, dtype=torch.float32, device=agent.device)
-            val_prev_actions_t = torch.tensor(val_prev_actions, dtype=torch.float32, device=agent.device)
-            val_actions_t = torch.tensor(val_actions, dtype=torch.float32, device=agent.device)
+            val_state_seqs_t = torch.tensor(val_state_seqs, dtype=torch.float32, device=agent.device)
+            val_action_seqs_t = torch.tensor(val_action_seqs, dtype=torch.float32, device=agent.device)
+            val_target_actions_t = torch.tensor(val_target_actions, dtype=torch.float32, device=agent.device)
             val_goals_t = torch.tensor(val_goals, dtype=torch.float32, device=agent.device)
-            inputs = torch.cat([val_states_t, val_prev_actions_t, val_goals_t], dim=1)
+            
+            batch_size_val = val_state_seqs_t.shape[0]
+            state_seq_flat = val_state_seqs_t.reshape(batch_size_val, -1)
+            action_seq_flat = val_action_seqs_t.reshape(batch_size_val, -1)
+            inputs = torch.cat([state_seq_flat, action_seq_flat, val_goals_t], dim=1)
+            
             predictions = agent.model(inputs, deterministic=True)
-            val_loss = torch.nn.functional.mse_loss(predictions, val_actions_t).item()
+            val_loss = torch.nn.functional.mse_loss(predictions, val_target_actions_t).item()
             agent.model.train()
         
         val_losses.append(val_loss)
