@@ -22,8 +22,8 @@ def collect_data(env, vgraph, num_episodes=100, max_steps=200, sequence_len=1):
             current_pos = state[:2]
             current_theta = state[2]
             
-            _, path = vgraph(current_pos)
-            if len(path) > 1:
+            path = vgraph.shortest_path(current_pos, goal)
+            if path is not None and len(path) > 1:
                 target = np.array(path[1])
             else:
                 target = goal

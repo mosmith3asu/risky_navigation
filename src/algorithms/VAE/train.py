@@ -30,8 +30,8 @@ def collect_training_data(env, vgraph, num_episodes=500, max_steps_per_episode=1
             current_pos = state[:2]
             current_theta = state[2]
             
-            _, path = vgraph(current_pos)
-            if len(path) > 1:
+            path = vgraph.shortest_path(current_pos, goal)
+            if path is not None and len(path) > 1:
                 target = np.array(path[1])
             else:
                 target = goal
@@ -180,51 +180,6 @@ def train_vae_agent(agent, train_data, val_data, num_epochs=100, batch_size=64):
         
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}")
-    
-    return train_losses, val_losses
-    
-    n_train_samples = len(train_data['states'])
-    n_batches = n_train_samples // batch_size
-    
-    for epoch in range(num_epochs):
-        # Training phase
-        agent.encoder.train()
-        agent.decoder.train()
-        epoch_loss = 0.0
-        
-        # Shuffle training data
-        indices = np.random.permutation(n_train_samples)
-        
-        for batch in range(n_batches):
-            start_idx = batch * batch_size
-            end_idx = min(start_idx + batch_size, n_train_samples)
-            batch_indices = indices[start_idx:end_idx]
-            
-            # Get batch data
-            batch_states = train_data['states'][batch_indices]
-            batch_actions = train_data['actions'][batch_indices]
-            batch_goals = train_data['goals'][batch_indices]
-            batch_next_actions = train_data['next_actions'][batch_indices]
-            
-            # Train step
-            loss = agent.train_step(batch_states, batch_actions, batch_goals, batch_next_actions)
-            epoch_loss += loss
-        
-        avg_train_loss = epoch_loss / n_batches
-        train_losses.append(avg_train_loss)
-        
-        # Validation phase
-        val_loss = agent.validate(
-            val_data['states'], val_data['actions'], 
-            val_data['goals'], val_data['next_actions']
-        )
-        val_losses.append(val_loss)
-        
-        # Print progress
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}: "
-                  f"Train Loss: {avg_train_loss:.6f}, "
-                  f"Val Loss: {val_loss:.6f}")
     
     return train_losses, val_losses
 
