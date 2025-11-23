@@ -1,85 +1,73 @@
-# Bayesian Next-Action Prediction
+# Bayesian Neural Network for Action Prediction
 
-This module uses Bayesian neural networks to predict the next action for an agent in a 2D navigation environment, with uncertainty quantification.
+Bayesian neural network for action prediction with uncertainty quantification.
 
-## Overview
+## Technical Workflow
 
-Unlike deterministic models (like the AutoEncoder), Bayesian neural networks provide not just predictions but also uncertainty estimates. This is particularly useful in risky navigation scenarios where knowing when the model is uncertain can help avoid potentially dangerous actions.
+### Input
+- **State Vector** (dim: state_dim): Current position, velocity, obstacles
+- **Goal Vector** (dim: goal_dim): Target position  
+- **Combined Input**: `[state, goal]` concatenated (dim: state_dim + goal_dim)
 
-## Files
-- `agent.py`: Defines the Bayesian neural network for next-action prediction.
-- `train.py`: Collects data from the environment and trains the Bayesian model.
-- `test.py`: Evaluates the trained model, visualizing predictions with uncertainty.
-- `__init__.py`: Marks this as a Python package.
-
-## How it Works
-
-1. **Data Collection:**
-   - Similar to the AutoEncoder approach, we collect (state, action, goal, next_action) tuples. 
+### Processing
+1. **Bayesian Layers**: Neural network with probabilistic weights
+   - Each weight is a distribution (mean μ, std σ) instead of fixed value
+   - Sample weights from distribution during forward pass
    
-2. **Bayesian Neural Network:**
-   - Instead of regular neural network layers with fixed weights, we use Bayesian layers.
-   - Each weight is represented by a probability distribution rather than a single value.
-   - During training and inference, we sample from these distributions to get the weights.
-   
-3. **Training:**
-   - We train the model using variational inference, which approximates the true Bayesian posterior.
-   - The loss function is the Evidence Lower Bound (ELBO), which combines:
-     - Negative log likelihood (how well the model fits the data)
-     - KL divergence (how much the learned distributions differ from the priors)
-   
-4. **Prediction:**
-   - For each input, we sample from the weight distributions multiple times.
-   - This gives us multiple different predictions, which we use to compute:
-     - The mean (our best guess at the next action)
-     - The standard deviation (our uncertainty about that guess)
+2. **Multiple Forward Passes**: Sample N times to get distribution of predictions
+   ```python
+   for i in range(n_samples):
+       weights_i = sample(weight_distribution)
+       action_i = forward(state, weights_i)
+   ```
 
-## Analogy: The Cautious Navigator
+3. **Training**: Variational inference with ELBO loss
+   ```python
+   loss = -log_likelihood(action|state) + KL(q(w)||p(w))
+   ```
+   - First term: how well model fits data
+   - Second term: regularization (how much distributions differ from priors)
 
-Imagine a navigator who doesn't just tell you "turn right here," but says "I'm 80% confident you should turn right, but there's a 20% chance you should go straight."
+### Output
+- **Mean Action** (dim: action_dim): Average of sampled predictions
+- **Uncertainty** (dim: action_dim): Standard deviation of sampled predictions
+- **Type**: Probabilistic prediction with epistemic uncertainty
 
-- **Regular AutoEncoder:** Like a navigator who always gives you a single direction, even when unsure.
-- **Bayesian Approach:** Like a navigator who tells you both the most likely direction AND how confident they are about it.
+## Model Architecture
 
-## Uncertainty in Action
+```python
+class BayesianNN(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = BayesianLinear(state_dim, hidden_dim)
+        self.fc2 = BayesianLinear(hidden_dim, action_dim)
+    
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        return self.fc2(x)
+    
+    def predict_with_uncertainty(self, state, n_samples=10):
+        predictions = [self.forward(state) for _ in range(n_samples)]
+        mean = torch.mean(predictions, dim=0)
+        std = torch.std(predictions, dim=0)
+        return mean, std
+```
 
-The uncertainty information provided by the Bayesian approach is valuable in several ways:
+## Hyperparameters
 
-1. **Safety:** When the model is uncertain, it can lead to more cautious behavior.
-2. **Exploration:** High uncertainty areas can be targeted for additional data collection.
-3. **Robustness:** The model can avoid making overconfident predictions in unfamiliar situations.
-
-## Hyperparameter Tuning
-
-Key parameters to tune include:
-
-- **Latent Dimension (`latent_dim`)**: Size of the bottleneck.
-- **Learning Rate (`lr`)**: Speed of optimization.
-- **KL Weight (`kl_weight`)**: How much to penalize complex distributions (higher = simpler model).
-- **Number of Samples (`n_samples`)**: How many times to sample for uncertainty estimation (higher = more accurate uncertainty).
+- `hidden_dim`: Hidden layer size (default: 64)
+- `lr`: Learning rate (default: 1e-3)
+- `kl_weight`: Weight for KL divergence term (default: 0.01)
+- `n_samples`: Number of samples for uncertainty estimation (default: 10)
+- `batch_size`: Batch size for training (default: 128)
+- `num_epochs`: Number of training epochs (default: 50)
 
 ## Usage
 
-```python
-# Train the Bayesian model
-python src/algorithms/Bayesian/train.py
+```bash
+# Train
+python -m src.algorithms.Bayesian.train
 
-# Test the model with uncertainty visualization
-python src/algorithms/Bayesian/test.py
+# Test with uncertainty visualization
+python -m src.algorithms.Bayesian.test
 ```
-
-## Bayesian vs. AutoEncoder Approach
-
-| Feature | AutoEncoder | Bayesian |
-|---------|-------------|----------|
-| Output | Point prediction | Mean prediction + uncertainty |
-| Training | Standard backprop | Variational inference |
-| Complexity | Lower | Higher |
-| Computation | Faster | Slower |
-| Use case | When you need speed & simplicity | When you need uncertainty & robustness |
-
-## References
-
-- Blundell, C., et al. (2015). Weight Uncertainty in Neural Networks.
-- Gal, Y., & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation.
-- Kingma, D. P., & Welling, M. (2013). Auto-Encoding Variational Bayes.

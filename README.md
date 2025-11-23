@@ -17,12 +17,11 @@ Hyperparamters are not optimized...
 # Neural Network Approaches for Action Prediction
 
 ## Overview
-This project implements multiple neural network architectures for predicting operator actions in a 2D navigation environment with communication delays. The goal is to predict actions based on current state, previous actions, and goal position - critical for space teleoperation scenarios with signal blackouts.
+This project implements multiple neural network architectures for predicting operator actions in a 2D navigation environment with communication delays. The goal is to predict actions based on current state and goal position - critical for space teleoperation scenarios with signal blackouts.
 
 ## Main Components
 - **Environment:** `src/env/continuous_nav_env.py` – Simulates the world, agent, obstacles, and goal.
 - **Algorithms:**
-  - **MLP Agent:** `src/algorithms/MLP/agent.py` – Multi-layer perceptron with bottleneck (previously misnamed "AutoEncoder")
   - **Linear Agent:** `src/algorithms/Linear/agent.py` – Simple linear regression baseline
   - **Bayesian Agent:** `src/algorithms/Bayesian/agent.py` – Probabilistic neural network with uncertainty estimates
   - **VAE Agent:** `src/algorithms/VAE/agent.py` – Variational autoencoder for action prediction
@@ -47,7 +46,6 @@ This project implements multiple neural network architectures for predicting ope
 jupyter notebook algorithm_comparison.ipynb
 
 # Or train individual algorithms
-python src/algorithms/MLP/train.py
 python src/algorithms/Linear/train.py
 python src/algorithms/Bayesian/train.py
 python src/algorithms/VAE/train.py
@@ -55,7 +53,6 @@ python src/algorithms/Transformer/train.py
 ```
 
 ## Key Notes
-- **MLP is NOT a true autoencoder** - it predicts actions, not reconstructed states
 - All models use supervised learning (behavioral cloning) for action prediction
 - Bayesian and VAE provide uncertainty estimates critical for safe autonomous operation
 - Transformer supports temporal sequences for modeling action history
