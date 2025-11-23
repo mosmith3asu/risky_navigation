@@ -32,8 +32,7 @@ class VAEDecoder(nn.Module):
 class VAEAgent:
     def __init__(self, state_dim, action_dim, goal_dim=None, latent_dim=32, hidden_dim=128, beta=1.0, lr=1e-3, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        input_dim = state_dim  # State only
-        self.encoder = VAEEncoder(input_dim, latent_dim, hidden_dim).to(self.device)
+        self.encoder = VAEEncoder(state_dim, latent_dim, hidden_dim).to(self.device)
         self.decoder = VAEDecoder(latent_dim, action_dim, hidden_dim).to(self.device)
         params = list(self.encoder.parameters()) + list(self.decoder.parameters())
         self.optimizer = optim.Adam(params, lr=lr)
@@ -48,7 +47,7 @@ class VAEAgent:
         self.encoder.train()
         self.decoder.train()
         self.optimizer.zero_grad()
-        mu, logvar = self.encoder(states)  # State only
+        mu, logvar = self.encoder(states)
         z = self.reparameterize(mu, logvar)
         predictions = self.decoder(z)
         recon_loss = nn.functional.mse_loss(predictions, expert_actions)
@@ -67,6 +66,6 @@ class VAEAgent:
                 squeeze = True
             else:
                 squeeze = False
-            mu, _ = self.encoder(state)  # State only
+            mu, _ = self.encoder(state)
             action = self.decoder(mu)
             return action.squeeze(0) if squeeze else action

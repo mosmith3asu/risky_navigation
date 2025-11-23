@@ -19,15 +19,14 @@ class TransformerModel(nn.Module):
 class TransformerAgent:
     def __init__(self, state_dim, action_dim, goal_dim=None, d_model=64, nhead=4, num_layers=2, dropout=0.1, lr=1e-3, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        input_dim = state_dim  # State only
-        self.model = TransformerModel(input_dim, action_dim, d_model, nhead, num_layers, dropout).to(self.device)
+        self.model = TransformerModel(state_dim, action_dim, d_model, nhead, num_layers, dropout).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
     
     def train_step(self, states, actions, goals, expert_actions):
         self.model.train()
         self.optimizer.zero_grad()
-        predictions = self.model(states)  # State only
+        predictions = self.model(states)
         loss = self.loss_fn(predictions, expert_actions)
         loss.backward()
         self.optimizer.step()
