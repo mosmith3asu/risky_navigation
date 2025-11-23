@@ -1,37 +1,41 @@
 # Bayesian Neural Network for Action Prediction
 
-Bayesian neural network for action prediction with uncertainty quantification.
+Bayesian neural network for temporal action prediction with epistemic uncertainty quantification.
+
+## Problem
+
+Predict operator actions with uncertainty estimates for safe teleoperation:
+- **Input**: Current state, previous action, goal
+- **Output**: Action prediction + uncertainty
+- **Use case**: Robot knows when predictions are unreliable during delays
 
 ## Technical Workflow
 
 ### Input
-- **State Vector** (dim: state_dim): Current position, velocity, obstacles
-- **Goal Vector** (dim: goal_dim): Target position  
-- **Combined Input**: `[state, goal]` concatenated (dim: state_dim + goal_dim)
+- **State Vector**: Position, velocity, heading, obstacle distances
+- **Previous Action**: Action from previous timestep
+- **Goal Vector**: Target position
 
 ### Processing
-1. **Bayesian Layers**: Neural network with probabilistic weights
-   - Each weight is a distribution (mean μ, std σ) instead of fixed value
-   - Sample weights from distribution during forward pass
-   
-2. **Multiple Forward Passes**: Sample N times to get distribution of predictions
-   ```python
-   for i in range(n_samples):
-       weights_i = sample(weight_distribution)
-       action_i = forward(state, weights_i)
-   ```
+```python
+# Weights are distributions, not fixed values
+for each layer:
+    weight ~ N(μ_w, σ_w²)
+    bias ~ N(μ_b, σ_b²)
 
-3. **Training**: Variational inference with ELBO loss
-   ```python
-   loss = -log_likelihood(action|state) + KL(q(w)||p(w))
-   ```
-   - First term: how well model fits data
-   - Second term: regularization (how much distributions differ from priors)
+action_t = network([state_t, action_{t-1}, goal])
+```
+
+Bayesian layers use weight distributions to capture model uncertainty.
+
+### Training
+- **Data**: Expert demonstrations from visibility graph
+- **Loss**: ELBO = Reconstruction loss + KL divergence
+- **Output**: Mean prediction (deterministic mode)
 
 ### Output
-- **Mean Action** (dim: action_dim): Average of sampled predictions
-- **Uncertainty** (dim: action_dim): Standard deviation of sampled predictions
-- **Type**: Probabilistic prediction with epistemic uncertainty
+- **Action**: (throttle, steering)
+- **Uncertainty**: Epistemic uncertainty from weight distributions
 
 ## Model Architecture
 

@@ -1,55 +1,43 @@
 # Transformer for Temporal Action Prediction
 
-Transformer model for action prediction using temporal sequences of states and self-attention mechanisms.
+Transformer model for temporal action prediction using self-attention over action sequences.
+
+## Problem
+
+Predict operator actions using temporal patterns from action history:
+- **Input**: Current state, previous action(s), goal
+- **Output**: Action prediction based on temporal context
+- **Use case**: Capture temporal dependencies in human control patterns
 
 ## Technical Workflow
 
 ### Input
-- **State Sequence** (dim: sequence_len × state_dim): History of past states
-- **Goal Vector** (dim: goal_dim): Target position
-- **Combined Input**: Sequence of `[state_t-k, ..., state_t]` where each includes goal information
+- **State Vector**: Position, velocity, heading, obstacle distances
+- **Previous Action(s)**: Recent action history (sequence_len determines history length)
+- **Goal Vector**: Target position
 
 ### Processing
-1. **Input Embeddings**: Map each state to higher-dimensional space
-   ```python
-   embeddings = [Linear(state_i) for state_i in sequence]
-   # Output: sequence_len × d_model
-   ```
+```python
+# Embed inputs
+x = embedding([state_t, action_{t-1}, goal])
 
-2. **Positional Encoding**: Add temporal position information
-   ```python
-   pos_encoded = embeddings + positional_encoding
-   # Sinusoidal encoding: PE(pos, 2i) = sin(pos/10000^(2i/d_model))
-   ```
+# Self-attention across time
+attention_output = transformer_encoder(x)
 
-3. **Self-Attention**: Compute relationships between time steps
-   ```python
-   Q, K, V = Linear(pos_encoded) for each head
-   attention_scores = softmax(Q @ K.T / sqrt(d_k))
-   attended = attention_scores @ V
-   # Output: sequence_len × d_model
-   ```
+# Predict action
+action_t = output_layer(attention_output)
+```
 
-4. **Feed-Forward Networks**: Process attention outputs
-   ```python
-   output = FFN(LayerNorm(attended + residual))
-   ```
+Transformer uses self-attention to weigh importance of different timesteps.
 
-5. **Action Prediction**: Map final representation to action
-   ```python
-   action = Linear(output[-1])  # Use last time step
-   # Output: action_dim
-   ```
-
-6. **Training**: MSE loss on predicted actions
-   ```python
-   loss = MSE(predicted_action, expert_action)
-   ```
+### Training
+- **Data**: Expert demonstrations from visibility graph
+- **Loss**: MSE between predicted and expert actions
+- **sequence_len**: Controls temporal context (1=no history, >1=temporal modeling)
 
 ### Output
-- **Action Vector** (dim: action_dim): Predicted action based on sequence
-- **Attention Weights** (dim: nhead × sequence_len × sequence_len): Which past states matter most
-- **Type**: Deterministic prediction with temporal context
+- **Action**: (throttle, steering) prediction
+- **Type**: Deterministic with temporal awareness
 
 ## Model Architecture
 

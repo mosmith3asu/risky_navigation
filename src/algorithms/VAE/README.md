@@ -1,45 +1,41 @@
 # Variational Autoencoder (VAE) for Action Prediction
 
-Variational Autoencoder for probabilistic action prediction with latent space modeling.
+VAE for temporal action prediction with latent space modeling.
+
+## Problem
+
+Predict operator actions while learning compressed latent representations:
+- **Input**: Current state, previous action, goal
+- **Output**: Action prediction from learned distribution
+- **Use case**: Model action variability and generate diverse behaviors
 
 ## Technical Workflow
 
 ### Input
-- **State Vector** (dim: state_dim): Current position, velocity, obstacles
-- **Goal Vector** (dim: goal_dim): Target position
-- **Combined Input**: `[state, goal]` concatenated (dim: state_dim + goal_dim)
+- **State Vector**: Position, velocity, heading, obstacle distances
+- **Previous Action**: Action from previous timestep
+- **Goal Vector**: Target position
 
 ### Processing
-1. **Encoder**: Maps input to latent distribution
-   ```python
-   mu, log_var = encoder([state, goal])
-   # mu: mean of latent distribution (dim: latent_dim)
-   # log_var: log variance of latent distribution (dim: latent_dim)
-   ```
+```python
+# Encode to latent distribution
+mu, log_var = encoder([state_t, action_{t-1}, goal])
+z = mu + exp(0.5 * log_var) * epsilon
 
-2. **Reparameterization**: Sample from latent distribution
-   ```python
-   std = exp(0.5 * log_var)
-   eps = randn_like(std)  # Random noise
-   z = mu + eps * std     # Latent sample (dim: latent_dim)
-   ```
+# Decode to action
+action_t = decoder(z)
+```
 
-3. **Decoder**: Maps latent sample to action prediction
-   ```python
-   action = decoder(z)  # (dim: action_dim)
-   ```
+VAE learns a compressed latent space representation of the state-action mapping.
 
-4. **Training**: ELBO loss (reconstruction + regularization)
-   ```python
-   reconstruction_loss = MSE(predicted_action, expert_action)
-   kl_loss = -0.5 * sum(1 + log_var - mu^2 - exp(log_var))
-   loss = reconstruction_loss + beta * kl_loss
-   ```
+### Training
+- **Data**: Expert demonstrations from visibility graph
+- **Loss**: ELBO = Reconstruction loss + β * KL divergence
+- **β**: Controls regularization strength (β-VAE)
 
 ### Output
-- **Action Prediction** (dim: action_dim): Sampled from learned distribution
-- **Latent Distribution**: Mean μ and variance σ² of latent space
-- **Type**: Probabilistic prediction with aleatoric uncertainty (can sample diverse actions)
+- **Action**: (throttle, steering) from latent sampling
+- **Latent**: Mean μ and variance σ² in latent space
 
 ## Model Architecture
 

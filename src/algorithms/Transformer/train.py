@@ -4,72 +4,70 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import trange
 from src.env.continuous_nav_env import ContinuousNavigationEnv
+from src.env.layouts import read_layout_dict
 from src.algorithms.Transformer.agent import TransformerAgent
 from src.utils.file_management import save_pickle, load_pickle
 from src.utils.logger import Logger
+from src.utils.visibility_graph import VisibilityGraph
 
-def collect_data(env, num_episodes=100, max_steps=200):
-    """
-    Collect data from random trajectories in the environment.
-    
-    Args:
-        env: Environment instance
-        num_episodes: Number of episodes to collect data from
-        max_steps: Maximum steps per episode
-        
-    Returns:
-        list: Dictionary containing state, action, goal, next_action
-    """
+def collect_data(env, vgraph, num_episodes=100, max_steps=200):
     data = []
-    for ep in trange(num_episodes, desc='Collecting data'):
+    for ep in trange(num_episodes, desc='Collecting expert data'):
         state = env.reset()
-        goal = env.goal.copy() if hasattr(env, 'goal') else np.zeros(2)
+        goal = env.goal.copy()
+        prev_action = np.zeros(env.action_space.shape[0])
+        
         for t in range(max_steps):
-            action = env.action_space.sample()
+            current_pos = state[:2]
+            current_theta = state[2]
+            
+            _, path = vgraph(current_pos)
+            if len(path) > 1:
+                target = np.array(path[1])
+            else:
+                target = goal
+            
+            direction = target - current_pos
+            desired_theta = np.arctan2(direction[1], direction[0])
+            angle_diff = desired_theta - current_theta
+            angle_diff = (angle_diff + np.pi) % (2 * np.pi) - np.pi
+            
+            steering = np.clip(angle_diff * 2.0, env.action_space.low[1], env.action_space.high[1])
+            dist_to_target = np.linalg.norm(direction)
+            
+            if dist_to_target < env.goal_radius * 3:
+                throttle = env.action_space.high[0] * 0.3
+            else:
+                throttle = env.action_space.high[0] * 0.8
+            
+            action = np.array([throttle, steering])
+            action = np.clip(action, env.action_space.low, env.action_space.high)
+            
             next_state, reward, done, info = env.step(action)
-            # For next_action prediction, sample a new action for the next state
-            next_action = env.action_space.sample() if not done else np.zeros_like(action)
+            
             data.append({
                 'state': state.copy(),
+                'prev_action': prev_action.copy(),
                 'action': action.copy(),
                 'goal': goal.copy(),
-                'next_action': next_action.copy(),
             })
+            
+            prev_action = action
             state = next_state
+            
             if done:
                 break
+    
     return data
 
 def prepare_arrays(data):
-    """
-    Convert data list to numpy arrays.
-    
-    Args:
-        data: List of dictionaries with state, action, goal, next_action
-        
-    Returns:
-        tuple: Arrays of states, actions, goals, next_actions
-    """
     states = np.stack([d['state'] for d in data])
+    prev_actions = np.stack([d['prev_action'] for d in data])
     actions = np.stack([d['action'] for d in data])
     goals = np.stack([d['goal'] for d in data])
-    next_actions = np.stack([d['next_action'] for d in data])
-    return states, actions, goals, next_actions
+    return states, prev_actions, actions, goals
 
-def split_data(states, actions, goals, next_actions, val_ratio=0.2):
-    """
-    Split data into training and validation sets.
-    
-    Args:
-        states: Array of states
-        actions: Array of actions
-        goals: Array of goals
-        next_actions: Array of next actions
-        val_ratio: Validation set ratio
-        
-    Returns:
-        tuple: Training and validation data arrays
-    """
+def split_data(states, prev_actions, actions, goals, val_ratio=0.2):
     n = states.shape[0]
     indices = np.random.permutation(n)
     val_size = int(n * val_ratio)
@@ -77,17 +75,17 @@ def split_data(states, actions, goals, next_actions, val_ratio=0.2):
     train_indices = indices[val_size:]
     
     train_states = states[train_indices]
+    train_prev_actions = prev_actions[train_indices]
     train_actions = actions[train_indices]
     train_goals = goals[train_indices]
-    train_next_actions = next_actions[train_indices]
     
     val_states = states[val_indices]
+    val_prev_actions = prev_actions[val_indices]
     val_actions = actions[val_indices]
     val_goals = goals[val_indices]
-    val_next_actions = next_actions[val_indices]
     
-    return (train_states, train_actions, train_goals, train_next_actions), \
-           (val_states, val_actions, val_goals, val_next_actions)
+    return (train_states, train_prev_actions, train_actions, train_goals), \
+           (val_states, val_prev_actions, val_actions, val_goals)
 
 def plot_losses(train_losses, val_losses, save_path=None):
     """
@@ -111,42 +109,42 @@ def plot_losses(train_losses, val_losses, save_path=None):
     plt.close()
 
 def main():
-    # --- Config ---
     num_episodes = 200
     max_steps = 200
     d_model = 64
     nhead = 4
     num_layers = 2
     dropout = 0.1
+    sequence_len = 1
     lr = 1e-3
     batch_size = 64
     num_epochs = 30
     val_ratio = 0.2
-    dataset_path = 'transformer_dataset.pickle'
+    dataset_path = 'transformer_expert_dataset.pickle'
     model_path = 'transformer_model.pth'
     
-    # --- Environment setup ---
-    env = ContinuousNavigationEnv()
+    layout_dict = read_layout_dict('example0')
+    env = ContinuousNavigationEnv(**layout_dict)
     logger = Logger(env)
     
-    # --- Data collection ---
+    vgraph = VisibilityGraph(env.goal, env.obstacles, env.bounds, resolution=(20, 20))
+    
     if os.path.exists(dataset_path):
         print(f"Loading dataset from {dataset_path}")
         data = load_pickle(dataset_path)
     else:
-        print(f"Collecting data from {num_episodes} episodes")
-        data = collect_data(env, num_episodes, max_steps)
+        print(f"Collecting expert data from {num_episodes} episodes")
+        data = collect_data(env, vgraph, num_episodes, max_steps)
         save_pickle(data, dataset_path)
         print(f"Dataset saved to {dataset_path}")
     
-    states, actions, goals, next_actions = prepare_arrays(data)
-    (train_states, train_actions, train_goals, train_next_actions), \
-    (val_states, val_actions, val_goals, val_next_actions) = \
-        split_data(states, actions, goals, next_actions, val_ratio)
+    states, prev_actions, actions, goals = prepare_arrays(data)
+    (train_states, train_prev_actions, train_actions, train_goals), \
+    (val_states, val_prev_actions, val_actions, val_goals) = \
+        split_data(states, prev_actions, actions, goals, val_ratio)
     
     print(f"Training set size: {len(train_states)}, Validation set size: {len(val_states)}")
     
-    # --- Model setup ---
     state_dim = states.shape[1]
     action_dim = actions.shape[1]
     goal_dim = goals.shape[1]
@@ -159,10 +157,12 @@ def main():
         nhead=nhead,
         num_layers=num_layers,
         dropout=dropout,
-        lr=lr
+        sequence_len=sequence_len,
+        lr=lr,
+        action_low=env.action_space.low,
+        action_high=env.action_space.high
     )
     
-    # --- Training ---
     train_losses = []
     val_losses = []
     num_batches = len(train_states) // batch_size
@@ -170,52 +170,47 @@ def main():
     
     print(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
-        # Shuffle training data
         indices = np.random.permutation(len(train_states))
         train_states_shuffled = train_states[indices]
+        train_prev_actions_shuffled = train_prev_actions[indices]
         train_actions_shuffled = train_actions[indices]
         train_goals_shuffled = train_goals[indices]
-        train_next_actions_shuffled = train_next_actions[indices]
         
-        # Train for one epoch
         epoch_loss = 0.0
         for batch_idx in trange(num_batches, desc=f"Epoch {epoch+1}/{num_epochs}"):
             start_idx = batch_idx * batch_size
             end_idx = start_idx + batch_size
             
             batch_states = train_states_shuffled[start_idx:end_idx]
+            batch_prev_actions = train_prev_actions_shuffled[start_idx:end_idx]
             batch_actions = train_actions_shuffled[start_idx:end_idx]
             batch_goals = train_goals_shuffled[start_idx:end_idx]
-            batch_next_actions = train_next_actions_shuffled[start_idx:end_idx]
             
-            loss = agent.train_step(batch_states, batch_actions, batch_goals, batch_next_actions)
+            loss = agent.train_step(batch_states, batch_prev_actions, batch_goals, batch_actions)
             epoch_loss += loss
         
-        # Compute average training loss
         avg_train_loss = epoch_loss / num_batches
         train_losses.append(avg_train_loss)
         
-        # Validate
-        val_loss = agent.validate(val_states, val_actions, val_goals, val_next_actions)
+        with torch.no_grad():
+            agent.model.eval()
+            val_states_t = torch.tensor(val_states, dtype=torch.float32, device=agent.device)
+            val_prev_actions_t = torch.tensor(val_prev_actions, dtype=torch.float32, device=agent.device)
+            val_actions_t = torch.tensor(val_actions, dtype=torch.float32, device=agent.device)
+            val_goals_t = torch.tensor(val_goals, dtype=torch.float32, device=agent.device)
+            inputs = torch.cat([val_states_t, val_prev_actions_t, val_goals_t], dim=-1)
+            predictions = agent.model(inputs)
+            val_loss = agent.loss_fn(predictions, val_actions_t).item()
+            agent.model.train()
+        
         val_losses.append(val_loss)
         
         print(f"Epoch {epoch+1}/{num_epochs}: Train Loss={avg_train_loss:.6f}, Val Loss={val_loss:.6f}")
         
-        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             agent.save(model_path)
-            print(f"New best model saved (val_loss: {val_loss:.6f})")
     
-    # --- Save final model if it's not already saved as the best ---
-    if val_losses[-1] > best_val_loss:
-        agent.save(model_path.replace('.pth', '_final.pth'))
-    
-    # Save losses for later analysis
-    agent.train_losses = train_losses
-    agent.val_losses = val_losses
-    
-    # --- Plot losses ---
     plot_losses(train_losses, val_losses, 'transformer_training_loss.png')
     print(f"Best validation loss: {best_val_loss:.6f}")
     print("Training complete!")

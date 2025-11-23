@@ -1,30 +1,35 @@
 # Linear Regression for Action Prediction
 
-Simple linear regression baseline for predicting operator actions in a 2D navigation environment.
+Simple linear baseline for temporal action prediction in teleoperation with communication delays.
+
+## Problem
+
+Predict operator actions to compensate for communication delays:
+- **Input**: Current state, previous action, goal
+- **Output**: Current action prediction
+- **Use case**: Robot predicts delayed human action to continue safe navigation
 
 ## Technical Workflow
 
 ### Input
-- **State Vector** (dim: state_dim): Current position, velocity, obstacles
-- **Goal Vector** (dim: goal_dim): Target position
-- **Combined Input**: `[state, goal]` concatenated (dim: state_dim + goal_dim)
+- **State Vector**: Position, velocity, heading, obstacle distances
+- **Previous Action**: Action from previous timestep (autoregressive)
+- **Goal Vector**: Target position
 
 ### Processing
-1. **Linear Transformation**: Single fully-connected layer
-   ```python
-   action = W * [state, goal] + b
-   ```
-   - `W`: Weight matrix (action_dim × input_dim)
-   - `b`: Bias vector (action_dim)
+```python
+action_t = W * [state_t, action_{t-1}, goal] + b
+```
 
-2. **Training**: Supervised learning with MSE loss
-   ```python
-   loss = MSE(predicted_action, expert_action)
-   ```
+Single linear layer maps concatenated input to action space.
+
+### Training
+- **Data**: Expert demonstrations from visibility graph optimal policy
+- **Loss**: MSE between predicted and expert actions
 
 ### Output
-- **Action Vector** (dim: action_dim): Predicted action (throttle, steering)
-- **Type**: Deterministic point prediction (no uncertainty)
+- **Action**: (throttle, steering) for RC car dynamics
+- **Type**: Deterministic prediction
 
 ## Model Architecture
 
