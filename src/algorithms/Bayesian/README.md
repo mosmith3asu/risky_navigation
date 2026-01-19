@@ -1,85 +1,90 @@
-# Bayesian Next-Action Prediction
+# Bayesian Neural Network for Temporal Action Prediction
 
-This module uses Bayesian neural networks to predict the next action for an agent in a 2D navigation environment, with uncertainty quantification.
+Bayesian neural network for temporal action prediction with epistemic uncertainty quantification.
 
-## Overview
+## Problem
 
-Unlike deterministic models (like the AutoEncoder), Bayesian neural networks provide not just predictions but also uncertainty estimates. This is particularly useful in risky navigation scenarios where knowing when the model is uncertain can help avoid potentially dangerous actions.
+Predict operator actions with uncertainty estimates using temporal history:
+- **Input**: State sequence, action sequence, goal
+- **Output**: Action prediction + uncertainty
+- **Use case**: Robot knows when predictions are unreliable during delays
 
-## Files
-- `agent.py`: Defines the Bayesian neural network for next-action prediction.
-- `train.py`: Collects data from the environment and trains the Bayesian model.
-- `test.py`: Evaluates the trained model, visualizing predictions with uncertainty.
-- `__init__.py`: Marks this as a Python package.
+## Technical Workflow
 
-## How it Works
+### Input
+- **State Sequence**: History of states `[state_{t-n}, ..., state_t]`
+  - Each state: Position, velocity, heading, obstacle distances
+- **Action Sequence**: History of actions `[action_{t-n}, ..., action_{t-1}]`
+- **Goal Vector**: Target position
+- **sequence_len**: Controls temporal history length
 
-1. **Data Collection:**
-   - Similar to the AutoEncoder approach, we collect (state, action, goal, next_action) tuples.
-   
-2. **Bayesian Neural Network:**
-   - Instead of regular neural network layers with fixed weights, we use Bayesian layers.
-   - Each weight is represented by a probability distribution rather than a single value.
-   - During training and inference, we sample from these distributions to get the weights.
-   
-3. **Training:**
-   - We train the model using variational inference, which approximates the true Bayesian posterior.
-   - The loss function is the Evidence Lower Bound (ELBO), which combines:
-     - Negative log likelihood (how well the model fits the data)
-     - KL divergence (how much the learned distributions differ from the priors)
-   
-4. **Prediction:**
-   - For each input, we sample from the weight distributions multiple times.
-   - This gives us multiple different predictions, which we use to compute:
-     - The mean (our best guess at the next action)
-     - The standard deviation (our uncertainty about that guess)
+### Processing
+```python
+# Flatten sequences
+state_flat = state_sequence.reshape(batch, -1)
+action_flat = action_sequence.reshape(batch, -1)
+input = concat([state_flat, action_flat, goal])
 
-## Analogy: The Cautious Navigator
+# Weights are distributions, not fixed values
+for each layer:
+    weight ~ N(μ_w, σ_w²)
+    bias ~ N(μ_b, σ_b²)
 
-Imagine a navigator who doesn't just tell you "turn right here," but says "I'm 80% confident you should turn right, but there's a 20% chance you should go straight."
+action_t = bayesian_network(input)
+```
 
-- **Regular AutoEncoder:** Like a navigator who always gives you a single direction, even when unsure.
-- **Bayesian Approach:** Like a navigator who tells you both the most likely direction AND how confident they are about it.
+Bayesian layers use weight distributions to capture model uncertainty over temporal patterns.
 
-## Uncertainty in Action
+### Training
+- **Data**: Expert demonstrations from visibility graph
+- **Sequences**: Created using sliding window over episodes
+- **Loss**: ELBO = Reconstruction loss + KL divergence
+- **Output**: Mean prediction (deterministic mode)
 
-The uncertainty information provided by the Bayesian approach is valuable in several ways:
+### Output
+- **Action**: (throttle, steering)
+- **Uncertainty**: Epistemic uncertainty from weight distributions
 
-1. **Safety:** When the model is uncertain, it can lead to more cautious behavior.
-2. **Exploration:** High uncertainty areas can be targeted for additional data collection.
-3. **Robustness:** The model can avoid making overconfident predictions in unfamiliar situations.
+## Model Architecture
 
-## Hyperparameter Tuning
+```python
+class BayesianNN(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = BayesianLinear(state_dim, hidden_dim)
+        self.fc2 = BayesianLinear(hidden_dim, action_dim)
+    
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        return self.fc2(x)
+    
+    def predict_with_uncertainty(self, state, n_samples=10):
+        predictions = [self.forward(state) for _ in range(n_samples)]
+        mean = torch.mean(predictions, dim=0)
+        std = torch.std(predictions, dim=0)
+        return mean, std
+```
 
-Key parameters to tune include:
+## Hyperparameters
 
-- **Latent Dimension (`latent_dim`)**: Size of the bottleneck.
-- **Learning Rate (`lr`)**: Speed of optimization.
-- **KL Weight (`kl_weight`)**: How much to penalize complex distributions (higher = simpler model).
-- **Number of Samples (`n_samples`)**: How many times to sample for uncertainty estimation (higher = more accurate uncertainty).
+- `sequence_len`: Temporal history length ⚠️ **Critical** (default: 5)
+  - Controls how many previous (state, action) pairs are used
+  - `sequence_len=1`: No temporal modeling
+  - `sequence_len>1`: Temporal sequence modeling with uncertainty
+- `hidden_dim`: Hidden layer size (default: 128, range: [64, 128, 256])
+- `prior_std`: Prior standard deviation for weight distributions (default: 1.0, range: [0.5, 1.0, 2.0])
+- `kl_weight`: Weight for KL divergence term (default: 1e-5, range: [1e-5, 1e-4, 1e-3])
+- `lr`: Learning rate (default: 1e-3, range: [1e-3, 5e-4, 1e-4])
+- `n_samples`: Number of samples for uncertainty estimation (default: 10)
+- `batch_size`: Batch size for training (default: 128)
+- `num_epochs`: Number of training epochs (default: 50)
 
 ## Usage
 
-```python
-# Train the Bayesian model
-python src/algorithms/Bayesian/train.py
+```bash
+# Train
+python -m src.algorithms.Bayesian.train
 
-# Test the model with uncertainty visualization
-python src/algorithms/Bayesian/test.py
+# Test with uncertainty visualization
+python -m src.algorithms.Bayesian.test
 ```
-
-## Bayesian vs. AutoEncoder Approach
-
-| Feature | AutoEncoder | Bayesian |
-|---------|-------------|----------|
-| Output | Point prediction | Mean prediction + uncertainty |
-| Training | Standard backprop | Variational inference |
-| Complexity | Lower | Higher |
-| Computation | Faster | Slower |
-| Use case | When you need speed & simplicity | When you need uncertainty & robustness |
-
-## References
-
-- Blundell, C., et al. (2015). Weight Uncertainty in Neural Networks.
-- Gal, Y., & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation.
-- Kingma, D. P., & Welling, M. (2013). Auto-Encoding Variational Bayes.

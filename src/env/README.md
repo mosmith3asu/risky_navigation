@@ -14,3 +14,4 @@ This file defines the `ContinuousNavigationEnv` class, which simulates a 2D navi
 - Returns all necessary information for reinforcement learning or imitation learning tasks.
 
 See the main README for workflow and integration details.
+ 

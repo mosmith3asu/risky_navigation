@@ -1,160 +1,115 @@
-# Transformer Approach for Next-Action Prediction
+# Transformer for Temporal Action Prediction
 
-This module implements a Transformer model for predicting the next action based on the current state, action, and goal in a navigation environment.
+Transformer model for temporal action prediction using self-attention over action sequences.
 
-## Overview
+## Problem
 
-The Transformer approach leverages the powerful self-attention mechanism introduced in the paper ["Attention Is All You Need"](https://arxiv.org/abs/1706.03762) by Vaswani et al. Unlike traditional sequential models like RNNs, Transformers process all inputs simultaneously and use attention to focus on relevant parts of the input, making them highly effective for capturing complex relationships between different elements.
+Predict operator actions using temporal patterns from action history:
+- **Input**: State sequence, action sequence, goal
+- **Output**: Action prediction based on temporal context
+- **Use case**: Capture temporal dependencies in human control patterns
 
-## How It Works
+## Technical Workflow
 
-### Transformer Architecture
+### Input
+- **State Sequence**: History of states `[state_{t-n}, ..., state_t]`
+  - Each state: Position, velocity, heading, obstacle distances
+- **Action Sequence**: History of actions `[action_{t-n}, ..., action_{t-1}]`
+- **Goal Vector**: Target position (replicated across sequence)
+- **sequence_len**: Controls temporal context ⚠️ **Critical for Transformer**
+  - `sequence_len=1`: No temporal modeling (falls back to feedforward)
+  - `sequence_len>1`: True self-attention over temporal sequences
 
-The Transformer model for next-action prediction consists of:
-
-1. **Input Embeddings**: Convert state, action, and goal vectors into higher-dimensional embeddings.
-2. **Positional Encoding**: Add information about the position of each element in the sequence.
-3. **Self-Attention**: Compute relationships between all pairs of elements in the input sequence.
-4. **Feed-Forward Networks**: Process the attention outputs through fully connected layers.
-5. **Output Layer**: Map the processed representations to the next action prediction.
-
-### Self-Attention Mechanism
-
-The key innovation of Transformers is the self-attention mechanism, which allows the model to weigh the importance of different parts of the input when making predictions:
-
-1. Each input element (state, action, goal) generates three vectors: query (Q), key (K), and value (V).
-2. Attention scores are computed as the dot product of queries and keys.
-3. These scores are normalized using softmax to get attention weights.
-4. The final output is a weighted sum of the value vectors, where the weights are the attention weights.
-
-This allows the model to dynamically focus on relevant information when making predictions. For example, in some scenarios, the goal might be more important for determining the next action, while in others, the current state might be more critical.
-
-## Advantages
-
-1. **Complex Relationships**: Captures intricate relationships between state, action, and goal through self-attention.
-2. **Parallelization**: Processes all inputs simultaneously, allowing for efficient training.
-3. **No Sequential Bottleneck**: Unlike RNNs, Transformers don't suffer from issues with long-range dependencies.
-4. **Interpretability**: Attention weights can provide insights into which inputs are most important for predictions.
-5. **Adaptability**: Can learn to focus on different aspects of the input depending on the situation.
-
-## Limitations
-
-1. **Data Hungry**: Typically requires more training data than simpler models.
-2. **Computational Cost**: More computationally intensive than linear or simple autoencoder models.
-3. **Hyperparameter Sensitivity**: Performance can be sensitive to hyperparameter choices (number of layers, heads, etc.).
-4. **Overfitting Risk**: With limited data, complex Transformer models may overfit.
-
-## Analogy
-
-Think of the Transformer approach as a panel of expert advisors making a group decision:
-
-> *Each advisor (attention head) specializes in different aspects of the situation. When deciding the next action, they all look at the current state, action, and goal. Some advisors might focus more on the goal, others on the current state, and they all share their insights. The final decision (next action) is made by considering all their weighted opinions.*
-
-This is different from:
-
-- **Linear**: A simple rule-based system that always follows the same formula.
-- **Autoencoder**: A process of condensing information to its essence before reconstructing the output.
-- **Bayesian**: A cautious approach that considers uncertainty and provides ranges rather than point estimates.
-- **A2C/DDPG**: Learning strategies that improve through trial and error over multiple attempts.
-
-## Implementation Details
-
-### Model Architecture
-
-The Transformer model consists of:
-
+### Processing
 ```python
-# Input embeddings
-state_embedding = nn.Linear(state_dim, d_model)
-action_embedding = nn.Linear(action_dim, d_model)
-goal_embedding = nn.Linear(goal_dim, d_model)
-
-# Positional encoding
-pos_encoder = PositionalEncoding(d_model)
-
-# Transformer encoder
-transformer_encoder = nn.TransformerEncoder(
-    nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead),
-    num_layers=num_layers
-)
-
-# Output layer
-output_layer = nn.Linear(d_model, action_dim)
+if sequence_len > 1:
+    # Concatenate state and action at each timestep
+    state_action = concat([state_sequence, action_sequence], dim=-1)
+    # Replicate goal across sequence
+    goal_expanded = goal.unsqueeze(1).expand(batch, seq_len, goal_dim)
+    inputs = concat([state_action, goal_expanded], dim=-1)
+    # Shape: (batch, seq_len, state_dim + action_dim + goal_dim)
+    
+    # Project to embedding space
+    x = input_projection(inputs)  # (batch, seq_len, d_model)
+    
+    # Self-attention across time
+    attention_output = transformer_encoder(x)  # (batch, seq_len, d_model)
+    
+    # Use last timestep for prediction
+    action_t = output_layer(attention_output[:, -1, :])  # (batch, action_dim)
+else:
+    # Fallback to feedforward network
+    inputs = concat([state, prev_action, goal])  # (batch, input_dim)
+    action_t = feedforward_network(inputs)  # (batch, action_dim)
 ```
 
-### Hyperparameters
+Transformer uses self-attention to weigh importance of different timesteps in action history.
 
-Key hyperparameters for the Transformer model:
+### Training
+- **Data**: Expert demonstrations from visibility graph
+- **Sequences**: Created using sliding window over episodes
+- **Loss**: MSE between predicted and expert actions
+- **Key**: sequence_len determines if true temporal modeling is used
 
-- `d_model`: Dimensionality of the model (embedding size)
-- `nhead`: Number of attention heads
-- `num_layers`: Number of transformer encoder layers
-- `dropout`: Dropout probability for regularization
-- `lr`: Learning rate for optimizer
+### Output
+- **Action**: (throttle, steering) prediction
+- **Type**: Deterministic with temporal awareness via attention
 
-### Training Process
+## Model Architecture
 
-The training process consists of:
+```python
+class TransformerModel(nn.Module):
+    def __init__(self, state_dim, action_dim, d_model=64, nhead=4, num_layers=2):
+        super().__init__()
+        # Input embedding
+        self.embedding = nn.Linear(state_dim, d_model)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead,
+            dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers
+        )
+        
+        # Output layer
+        self.fc_out = nn.Linear(d_model, action_dim)
+    
+    def forward(self, state_sequence):
+        # state_sequence: (batch, sequence_len, state_dim)
+        x = self.embedding(state_sequence)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        action = self.fc_out(x[:, -1, :])  # Use last time step
+        return action
+```
 
-1. **Data Collection**: Collect state-action-goal triplets and corresponding next actions.
-2. **Data Preparation**: Split data into training and validation sets.
-3. **Model Training**: 
-   - Convert inputs to embeddings
-   - Apply positional encoding
-   - Process through transformer encoder
-   - Predict next action
-   - Update weights using backpropagation
-4. **Validation**: Monitor performance on a validation set to prevent overfitting.
-5. **Learning Rate Scheduling**: Adjust learning rate based on validation loss.
+## Hyperparameters
+
+- `d_model`: Embedding dimensionality (default: 64, range: [32, 64, 128])
+- `nhead`: Number of attention heads (default: 4, range: [4, 8])
+- `num_layers`: Transformer encoder layers (default: 2, range: [2, 3, 4])
+- `sequence_len`: Length of input sequence ⚠️ **Critical** (default: 1, range: [1, 5, 10])
+  - `sequence_len=1`: No temporal modeling (feedforward network)
+  - `sequence_len>1`: True temporal sequence modeling
+- `dropout`: Dropout probability (default: 0.1, range: [0.0, 0.1, 0.2])
+- `lr`: Learning rate (default: 1e-3, range: [1e-3, 5e-4, 1e-4])
+- `batch_size`: Batch size for training (default: 128)
+- `num_epochs`: Number of training epochs (default: 50)
 
 ## Usage
 
-### Training
-
 ```bash
+# Train
 python -m src.algorithms.Transformer.train
-```
 
-This will:
-1. Collect a dataset of state-action-goal triplets and next actions.
-2. Train the transformer model to predict next actions.
-3. Save the trained model and training statistics.
-
-### Testing
-
-```bash
+# Test with attention visualization
 python -m src.algorithms.Transformer.test
-```
-
-This will:
-1. Load the trained model.
-2. Evaluate the prediction accuracy.
-3. Visualize attention weights (if applicable).
-4. Test the model by using it to navigate through the environment.
-5. Display and save visualizations of the results.
-
-## Extensions and Variations
-
-Possible extensions to the basic Transformer approach:
-
-1. **Trajectory Transformers**: Incorporate past trajectory information for better context.
-2. **Multimodal Transformers**: Combine different input modalities (e.g., visual observations with state vectors).
-3. **Sparse Attention**: Use sparse attention patterns to improve efficiency for larger inputs.
-4. **Transformer-XL**: Extend context length using segment-level recurrence.
-5. **Uncertainty Estimation**: Add dropout at inference time to estimate prediction uncertainty.
-
-## Comparison with Other Approaches
-
-| Aspect | Transformer | Linear | Autoencoder | Bayesian |
-|--------|------------|--------|-------------|----------|
-| Complexity | High | Low | Medium | Medium-High |
-| Training Speed | Moderate | Fast | Moderate | Slow |
-| Performance (simple) | Good | Good | Good | Good |
-| Performance (complex) | Excellent | Poor | Good | Good |
-| Interpretability | Medium (via attention) | High | Low | Medium |
-| Data Efficiency | Low | High | Medium | Medium |
-| Computational Cost | High | Low | Medium | Medium-High |
-
-## Conclusion
-
-The Transformer approach offers a powerful and flexible method for next-action prediction in navigation environments. By leveraging self-attention mechanisms, it can capture complex relationships between state, action, and goal, potentially leading to more accurate predictions in complex scenarios. While more computationally intensive and data-hungry than simpler approaches, its ability to model complex dependencies makes it a valuable addition to the algorithmic toolkit, especially when dealing with tasks that require understanding intricate relationships between inputs.
+``` 
