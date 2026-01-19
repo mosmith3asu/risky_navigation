@@ -11,11 +11,13 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from datetime import datetime
-
+import math
+import time
+from matplotlib.table import Table
 
 from utils.file_management import save_pickle, load_pickle, load_latest_pickle, get_algorithm_dir
-from learning.utils import OUNoise,OUNoiseBounded, ReplayBuffer, ProspectReplayBuffer, Schedule, \
-    pdf_expectation_torch_batch, quantile_expectation
+from learning.utils import OUNoise, ReplayBuffer, ProspectReplayBuffer, Schedule
+from learning.risk_measures import CumulativeProspectTheory
 
 # ===== Networks =====
 
@@ -110,9 +112,11 @@ class DDPGAgent:
                  ou_sigma_decay = 0.99,
                  grad_clip=None,
                  device=None,
+
+                 verbose=True,
                  **kwargs):
 
-        self.enable_print_report = True
+        self.enable_print_report = verbose
         self.env = env
         self.gamma = gamma
         self.tau = tau
@@ -158,9 +162,10 @@ class DDPGAgent:
         self.optimC = optim.Adam(self.critic.parameters(), lr = critic_lr)
 
         self.replay = ReplayBuffer(self.state_dim, self.action_dim, size=buffer_size, device=self.device)
-        self.ou = OUNoise(self.action_dim, theta=ou_theta, sigma=ou_sigma,
-                          sigma_decay=ou_sigma_decay, n_envs=1, device=self.device)
+        # self.ou = OUNoise(self.action_dim, theta=ou_theta, sigma=ou_sigma,
+        #                   sigma_decay=ou_sigma_decay, n_envs=1, device=self.device)
 
+        OUNoise(self.action_dim, device=self.device, **kwargs.pop('ou_noise', {}))
 
         # Logging and Schedules
         self.max_episodes = None
@@ -343,11 +348,13 @@ class DDPGAgent:
         self.sched_ax.set_xlabel('Episode')
 
         # Right column: single axis spanning all rows
-        self.render_ax = self.fig.add_subplot(gs[:, 1])
+        self.render_ax = self.fig.add_subplot(gs[:-1, 1])
         self.render_ax.set_xticks([])
         self.render_ax.set_xticklabels([])
         self.render_ax.set_yticks([])
         self.render_ax.set_yticklabels([])
+
+        self.status_ax = self.fig.add_subplot(gs[-1, 1])
 
         # Adjust layout
         # plt.tight_layout()
@@ -492,6 +499,130 @@ class DDPGAgent:
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
 
+
+    def _compute_status_fontsize(self, rows, cols):
+        """Pick a fontsize (in points) to fit current axis size and cell count."""
+        ax = self.status_ax
+        fig = ax.figure
+        # axis bbox in inches
+        bbox_in = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+        w_px = bbox_in.width * fig.dpi
+        h_px = bbox_in.height * fig.dpi
+        # conservative fit: leave room for padding and variable string lengths
+        cell_w = max(1.0, w_px / max(1, cols))
+        cell_h = max(1.0, h_px / max(1, rows))
+        # Heuristics: characters roughly square-ish in many UI fonts; prefer height
+        fs_from_h = cell_h * 0.45
+        fs_from_w = cell_w * 0.22  # allow ~4–5 chars per cell-width at this scale
+        fs = min(fs_from_h, fs_from_w)
+        return max(6, min(24, fs))  # clamp to a reasonable range
+
+    def _ensure_resize_hook(self):
+        """Connect a resize hook once; it just re-tunes fonts next draw."""
+        if getattr(self, "_status_resize_cid", None) is None and self.status_ax.figure.canvas is not None:
+            def _on_resize(event):
+                if getattr(self, "_status_table", None) is not None:
+                    rows, cols = self._status_shape
+                    fs = self._compute_status_fontsize(rows, cols)
+                    for (r, c), cell in self._status_cells.items():
+                        cell.get_text().set_fontsize(fs)
+                    self.status_ax.figure.canvas.draw_idle()
+            self._status_resize_cid = self.status_ax.figure.canvas.mpl_connect("resize_event", _on_resize)
+
+    def _plot_status(self, n_cols=1, cell_facecolor="#f5f5f7", edgecolor="#dddddd", **kwargs):
+        """
+        Draw/update a values-only table of kwargs on self.status_ax.
+
+        Parameters
+        ----------
+        n_cols : int
+            Number of table columns. Rows are computed automatically.
+        cell_facecolor : color
+            Background color for cells.
+        edgecolor : color
+            Edge color for grid lines.
+        **kwargs :
+            Key/value pairs to render. Only the *values* are shown in cells.
+
+        Behavior
+        --------
+        - Rebuilds the grid if shape/column count changes.
+        - Otherwise updates cell texts in-place for speed.
+        - Font size auto-adjusts to axis size on each call and on window resize.
+        """
+        ax = self.status_ax
+        items = list(kwargs.items())
+        n_items = len(items)
+        n_cols = max(1, int(n_cols))
+        n_rows = max(1, math.ceil(n_items / n_cols))
+
+        # Prepare axis
+        ax.set_axis_off()
+
+        # If no table exists yet, or geometry changed, rebuild
+        needs_rebuild = (
+            getattr(self, "_status_table", None) is None
+            or getattr(self, "_status_shape", None) != (n_rows, n_cols)
+        )
+
+        if needs_rebuild:
+            ax.clear()
+            ax.set_axis_off()
+
+            tbl = Table(ax, bbox=[0, 0, 1, 1])
+            ax.add_table(tbl)
+
+            # Even column widths, row heights
+            col_w = 1.0 / n_cols
+            row_h = 1.0 / n_rows
+
+            cells = {}
+            # Build all cells (values only)
+            for r in range(n_rows):
+                for c in range(n_cols):
+                    # Table cells are positioned by (row, col)
+                    cell = tbl.add_cell(row=r, col=c,
+                                        width=col_w, height=row_h,
+                                        text="",
+                                        loc="center",
+                                        facecolor=cell_facecolor,
+                                        edgecolor=edgecolor)
+                    # Slightly tighter text box so long values don't clip too early
+                    cell.PAD = 0.02
+                    cells[(r, c)] = cell
+
+            self._status_table = tbl
+            self._status_cells = cells
+            self._status_shape = (n_rows, n_cols)
+            self._status_keys = []  # will set below
+            self._ensure_resize_hook()
+
+        # Update texts and remember current key order -> cell mapping
+        fs = self._compute_status_fontsize(n_rows, n_cols)
+        keys_in_order = []
+        for idx, (k, v) in enumerate(items):
+            r = idx // n_cols
+            c = idx % n_cols
+            if (r, c) in self._status_cells:
+                cell = self._status_cells[(r, c)]
+                cell.get_text().set_text("" if v is None else str(v))
+                cell.get_text().set_fontsize(fs)
+                cell.get_text().set_color("black")
+            keys_in_order.append(k)
+
+        # Clear any extra cells (e.g., last row partially filled)
+        for idx in range(n_items, n_rows * n_cols):
+            r = idx // n_cols
+            c = idx % n_cols
+            if (r, c) in self._status_cells:
+                self._status_cells[(r, c)].get_text().set_text("")
+
+        self._status_keys = keys_in_order
+
+        # Redraw efficiently
+        if self.status_ax.figure.canvas is not None:
+            self.status_ax.figure.canvas.draw_idle()
+
     def _get_fpath(self, fname=None, prefix='', suffix= '', save_dir = './models/', with_dir = True, with_tstamp=True):
         assert not (fname is not None and suffix == ''), "Provide either a whole fname or a suffix, not both."
         # Format filename
@@ -560,7 +691,8 @@ class DDPGAgent_EUT(DDPGAgent):
         del self.rollouts_per_epi
         del self.history
 
-
+        self._tstart = time.time()
+        self.cpt = CumulativeProspectTheory(b=0.0, lam=1, eta_p=1, eta_n=1, delta_p=1, delta_n=1)
 
         self.fig_title = kwargs.pop('fig_title', f'DDPG-EUT Agent ({self.start_time_str})')
         self.delay_steps = self.env.delay_steps
@@ -578,15 +710,7 @@ class DDPGAgent_EUT(DDPGAgent):
             'sigma': 0.5,
             'sigma_decay': 0.99,
             'sigma_min': 0.05,
-            'dt': self.env.dt,
-            'low': (-0.5, -0.5),
-            'high': (0.5, 0.75), # bias to drive forward
-            # 'low': -1.0,
-            # 'high': 1.0,
-            'mode': "squash",
             'device': self.device,
-            'decay_freq': None # (decay on reset)
-
         }
         ou_noise_params.update(kwargs.pop('ou_noise', {}))
         # self.ou = OUNoiseBounded(**ou_noise_params)
@@ -600,8 +724,6 @@ class DDPGAgent_EUT(DDPGAgent):
             'xend': 0,
             'horizon': self.random_start_epis,
             'mode': 'linear',
-            # 'mode': 'exponential',
-            # 'exp_gain': 2, # higher gain=faster decay
         }
         rand_start_sched_params = kwargs.pop('rand_start_sched', def_rand_start_sched_params)
         rand_start_sched_params.update({'name':'rand_start_sched'})
@@ -657,58 +779,68 @@ class DDPGAgent_EUT(DDPGAgent):
 
     def warmup(self):
         _spin = ['-','|','\\','-','/']
+        p = self.rand_start_sched.sample(at=0) if self.random_start_epis > 0 else 0
+        self.env.reset(p_rand_state=p, **self.reset_params)
+        self.ou.reset(reset_sigma=True)
 
         for ep in range(self.warmup_epis):
-            print(f'\r [{_spin[ep%len(_spin)]}] Running Warmup... [Prog: {int(ep/self.warmup_epis*100)}%]',end='',flush=True)
+            if self.replay.full:
+                break
 
-            # RESETS
-            p = self.rand_start_sched._x0 if self.random_start_epis>0 else 0
-            self.env.reset(p_rand_state = p, **self.reset_params)
-            self.ou.reset()
+            if self.enable_print_report:
+                print(f'\r [{_spin[ep%len(_spin)]}] Running Warmup... '
+                      f'[Prog: {int(ep/self.warmup_epis*100)}%]',end='',flush=True)
 
-
-            i=0
-            while i <= self.env.max_steps:
+            for i in range(self.env.max_steps):
                 o1 = self.env.observation
+                o1_pt = torch.tensor(o1, dtype=torch.float32, device=self.device)
 
                 # Step envs ############################################
-                a_pt = self.ou.sample()
-                # a = np.random.uniform(self.a_low.cpu().numpy(), self.a_high.cpu().numpy(),size=(self.action_dim)).astype(np.float32)
-                ns_samples, r_samples, done_samples, info = self.env.step(a_pt.cpu().numpy().flatten())
+                a1_pt = self.ou.sample()
+                a1 = a1_pt.cpu().numpy().flatten()
+                ns_samples, r_samples, done_samples, info = self.env.step(a1)
 
                 o2 = self.env.observation
+                o2_pt = torch.tensor(o2, dtype=torch.float32, device=self.device)
 
                 # Create transition prospects and store in mem ################################
                 r_probs = np.array(self.env.robot_probs)
                 r_prospects = np.vstack([r_samples, r_probs])
 
-                self.replay.add(o1, a_pt, r_prospects, o2, done_samples)
+                self.replay.add(o1_pt, a1_pt, r_prospects, o2_pt, done_samples)
 
-                i += 1
                 if info['true_done']:
-                    break
+                    self.env.reset(p_rand_state=p, **self.reset_params)
+                    self.ou.reset()
+                    # break
         print('\n')
-        self.ou.reset_sigma()
+
 
     def train(self, max_episodes=1_000):
         self.max_episodes = max_episodes
         self.warmup()
 
-        running_rewards = 0
+        running_rewards = [0]
         running_xys = deque(maxlen=self.env.max_steps)
         running_acts = deque(maxlen=self.env.max_steps)
         running_actor_loss = deque(maxlen=self.env.max_steps)
         running_critic_loss = deque(maxlen=self.env.max_steps)
+        ep_duration = deque(maxlen=self.log_interval)
+
+        p_rand_state = self.rand_start_sched.sample(at=0)
+        self.env.reset(p_rand_state=p_rand_state, **self.reset_params)
+        self.ou.reset(reset_sigma=True)
 
         for ep in range(1, max_episodes + 1):
+            ep_tstart = time.time()
             self._plot_spin()
-            p_rand_state = self.rand_start_sched.sample(at=ep)
-            # p_rand_state = max(0, (1 - ep / self.random_start_epis) if self.random_start_epis>0 else 0)
-            self.env.reset(p_rand_state = p_rand_state,**self.reset_params)
-            self.ou.reset()
+            self.ou.sched.advance()
+            self.rand_start_sched.advance()
+            p_rand_state = self.rand_start_sched.sample()
+
 
             # ----------------------------------------------------------------------------
-            for i in range(self.env.max_steps):
+            for i in range(self.env.max_steps+1):
                 # Observe and act ############################################
                 o1 = self.env.observation
                 o1_pt = torch.tensor(o1, dtype=torch.float32, device=self.device)
@@ -734,45 +866,51 @@ class DDPGAgent_EUT(DDPGAgent):
 
 
                 # Log for reporting #########################################################
-                running_rewards += info['true_reward']
+                running_rewards[-1] += info['true_reward']
                 running_xys.append(info['true_next_state'][0,:2])
                 running_acts.append(a1)
 
-                if info['true_done']:
+                if info['true_done'] or info['true_reason']=='max_steps':
                     self.history['terminal'].append(info['true_reason'])
-                    self.history['ep_len'].append(i)
-                    self.history['ep_reward'].append(running_rewards);  running_rewards = 0
-                    self.history['xy'].append(np.array(running_xys));   running_xys.clear()
-                    self.history['action'].append(np.mean(np.array(running_acts),axis=0)); running_acts.clear()
-                    self.history['actor_loss'].append(np.mean(np.array(running_actor_loss)) if len(running_actor_loss)>0 else 0.0)
-                    self.history['critic_loss'].append(np.mean(np.array(running_critic_loss)) if len(running_critic_loss)>0 else 0.0)
-                    self.history['ou_sigma'].append(np.mean(self.ou.sigma))
-                    self.history['rand_start'].append(p_rand_state)
+                    self.history['ep_len'].append(self.env.steps)
+                    self.history['xy'].append(np.array(running_xys))
+                    self.history['action'].append(np.mean(np.array(running_acts),axis=0))
 
-                    running_actor_loss.clear()
-                    running_critic_loss.clear()
+                    self.env.reset(p_rand_state=p_rand_state, **self.reset_params)
+                    self.ou.reset()
+
+                    running_acts.clear()
+                    running_xys.clear()
+
+                    if i < self.env.max_steps -1:
+                        running_rewards.append(0)
+
+                    # break
 
 
-                    if info['true_reason'] == 'max_steps':
-                        self.env.state.add_random_robot_state(
-                            observation = info['true_next_state']
-                        )
-                    break
-
-                # o1    = o2.copy()
-                # o1_pt = o2_pt
 
                 # end timestep ---------------------------------------------------------------
+            # self.history['ep_reward'].append(running_rewards); running_rewards = 0
+            self.history['ep_reward'].append(np.mean(running_rewards))
+            self.history['actor_loss'].append(np.mean(np.array(running_actor_loss)) if len(running_actor_loss) > 0 else 0.0)
+            self.history['critic_loss'].append(np.mean(np.array(running_critic_loss)) if len(running_critic_loss) > 0 else 0.0)
+            self.history['ou_sigma'].append(self.ou.sigma)
+            self.history['rand_start'].append(p_rand_state)
+
+            running_actor_loss.clear()
+            running_critic_loss.clear()
+            running_rewards = [0]
+            ep_duration.append(time.time() - ep_tstart)
 
 
             # LOG EPISODE #################################################################
             if self.enable_print_report:
-                print(f"[DDPG] Episode {ep} ({i} it; {i * self.env.dt:.1f}sec)"
+                print(f"[DDPG] Episode {ep} ({np.mean(self.history['ep_len']):.1f} it; {np.mean(self.history['ep_len']) * self.env.dt:.1f}sec)"
                       f"| AvgRet: {np.mean(self.history['ep_reward']):.2f} "
                       f"| MemLen: {len(self.replay)}"
-                      f"| P(rand state):{p_rand_state:.2f}"
-                      f"| OU(sigma): {np.mean(self.ou.sigma): .3f}"
-                      f"| Terminal: {self.history['terminal'][-1]}"
+                      f"| P(s_rand):{p_rand_state:.2f}"
+                      f"| OU(sigma): {np.mean(self.history['ou_sigma']): .3f}"
+                      f"| Term: {self.history['terminal'][-1]}"
                       f"| Mean Act: {np.round(self.history['action'][-1],2)}"
                       )
 
@@ -789,6 +927,7 @@ class DDPGAgent_EUT(DDPGAgent):
                                    terminal_history=self.history['terminal'],
                                    filt_reward_history=self.history['timeseries_filt_rewards'],
                                    log_interval=self.log_interval)
+
                 self._plot_losses(
                     actor_loss_history=self.history['actor_loss'],
                     critic_loss_history=self.history['critic_loss'],
@@ -798,6 +937,19 @@ class DDPGAgent_EUT(DDPGAgent):
                                     rand_start = self.history['rand_start'],
                                      log_interval=1
                                    )
+
+                epi_dur= np.mean(ep_duration)
+                epi_prog = (ep / max_episodes) *100
+                rem_epi = max_episodes - ep
+                rem_time = (rem_epi * epi_dur) / 60.0/60.0  # in hours
+                run_time = self.runtime_sec / 60 / 60
+                self._plot_status(ep_duration= f"Epi Dur [{epi_dur:.2f} sec]",
+                                  ep_length = f"Epi Len [{np.mean(self.history['ep_len']):.1f} it]",
+                                  run_time=f"Elapsed   [{epi_prog:.1f}% | {run_time:.1f} hr]",
+                                  rem_time=f"Remaining [{1-epi_prog:.1f}% | {rem_time:.1f} hr]",
+                                  episode=f'Epi [ep]',)
+                # self.ou.plot(ax=self.sched_ax)
+                # self.rand_start_sched.plot(ax=self.sched_ax)
 
                 self.history['terminal'].clear()
                 self.history['ep_len'].clear()
@@ -811,9 +963,10 @@ class DDPGAgent_EUT(DDPGAgent):
 
     def risk_measure(self,vals,probs):
         """Computes rational expectation from vals and pdf (probs)."""
+        return self.cpt.sample_expectation_batch(vals)
         # return pdf_expectation_torch_batch(vals, probs)
-        expectations= quantile_expectation(vals)
-        return torch.tensor(expectations, dtype=torch.float32, device=self.device)
+        # expectations= quantile_expectation(vals)
+        # return torch.tensor(expectations, dtype=torch.float32, device=self.device)
 
 
     def _update_sgd(self, updates=1):
@@ -881,6 +1034,9 @@ class DDPGAgent_EUT(DDPGAgent):
         s += str(self.rand_start_sched) + f'\n'
         s += str(self.env) + f'\n'
         return s
+    @property
+    def runtime_sec(self):
+        return time.time() - self._tstart
 
 class DDPGAgentVec(DDPGAgent):
     """

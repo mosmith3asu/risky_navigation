@@ -11,7 +11,7 @@ import json
 class VisibilityGraph:
     """A class to build a visibility graph for the continuous navigation environment."""
 
-    def __init__(self, goal, obstacles, bounds, resolution=(20, 20),cached=True):
+    def __init__(self, goal, obstacles, bounds, resolution=(20, 20),cached=True, verbose=True):
         if isinstance(resolution, int):
             dx = (bounds[1][0] - bounds[0][0])
             dy = (bounds[1][1] - bounds[0][1])
@@ -21,8 +21,9 @@ class VisibilityGraph:
         if resolution[0]*resolution[1] < 20*20:
             print(f"Warning: visibility graph resolution {resolution} may be low; "
                   f"consider increasing to at least 400 elements (e.g., 20x20) for better accuracy." ,file=sys.stderr)
-
-        print('Precomuting visibility graph...')
+        self.verbose = verbose
+        if self.verbose:
+            print('Precomuting visibility graph...')
         self.goal = tuple(goal)
         self.obstacles = [self.create_poly(obstacle) for obstacle in obstacles]
         self.bounds = bounds
@@ -33,20 +34,20 @@ class VisibilityGraph:
         if self.cached and self.is_cached():
             self.load_cache()
         else:
-            print('\t| Recomputing...')
-            print('\t| Creating grid...')
+            if self.verbose:print('\t| Recomputing...')
+            if self.verbose:print('\t| Creating grid...')
             self.grid = self.create_grid(bounds, resolution)
-            print('\t| Building graph...')
+            if self.verbose:print('\t| Building graph...')
             self.graph = self.build_graph(self.grid)
-            print('\t| Computing distances grid...')
+            if self.verbose:print('\t| Computing distances grid...')
             self.dist_grid,self.norm_grid = self.precompute_distances(self.grid, self.graph)
             self.invalid_mask = np.where(self.norm_grid == np.inf, True,False)
             self.invalid_offset = 1e6*self.invalid_mask
             self.max_dist = np.max(self.norm_grid[~self.invalid_mask])  # max distance to goal in valid grid points
             if self.cached:
-                print('\t| saving to cache...')
+                if self.verbose: print('\t| saving to cache...')
                 self.save_cache()
-        print('\t| finished.')
+        if self.verbose:print('\t| finished.')
 
     def closest_idx(self, x, y):
         # if self.is_compiled:
@@ -287,7 +288,7 @@ class VisibilityGraph:
             self.invalid_mask = cached_obj.invalid_mask
             self.invalid_offset = cached_obj.invalid_offset
             self.max_dist = cached_obj.max_dist
-            print('\t| loaded from cache.')
+            if self.verbose: print('\t| loaded from cache.')
 
     def save_cache(self):
         # save this object to a pickle file

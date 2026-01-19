@@ -16,17 +16,49 @@ from env.mdp import Compiled_LidarFun, Belief_FetchRobotMDP_Compiled
 from utils.file_management import get_project_root
 
 
+#################################################################################
+# GLOBALS #######################################################################
+#################################################################################
+## BEST---------------
+# REWARD_GOAL = 100
+# REWARD_COLLIDE = -500
+# # REWARD_STEP =  -0.1
+# REWARD_DIST2GOAL_EXP = 1.0
+# REWARD_DIST2GOAL_PROG = False
+# REWARD_DIST2GOAL = 0.1
+# REWARD_STOPPING = 0.001
+# REWARD_STEP =  -(REWARD_DIST2GOAL + REWARD_STOPPING)
+## BEST---------------
 
+# --- (top)
+# REWARD_GOAL = 100
+# REWARD_COLLIDE = -500
+# REWARD_DIST2GOAL_EXP = 1.0
+# REWARD_DIST2GOAL_PROG = False
+# REWARD_DIST2GOAL = 0.1
+# REWARD_STOPPING = 0.001
+# REWARD_STEP =  -(REWARD_DIST2GOAL + REWARD_STOPPING)
+
+# 15:33:15 (Bottom)
+REWARD_GOAL = 100
+REWARD_COLLIDE = -500
+REWARD_DIST2GOAL_EXP = 1.0
+REWARD_DIST2GOAL_PROG = True
+REWARD_DIST2GOAL = 0.1
+REWARD_STOPPING = 0.001
+REWARD_STEP =  -(REWARD_DIST2GOAL + REWARD_STOPPING)
 
 #################################################################################
 # MDP and State Classes #########################################################
 #################################################################################
 
 class Delayed_LidarState:
-    def __init__(self, X0, f_dist2goal, f_lidar, delay_steps, dt, n_rays=10,
+    def __init__(self, X0, f_dist2goal, f_lidar, delay_steps, dt, n_rays=12,
                  bounds = ((-np.inf,-np.inf),(np.inf,np.inf)),
-                 robot_state_validator = None, n_samples = 50,
+                 robot_state_validator = None,
+                 n_samples = 50,
                  **kwargs):
+
 
         # -------------------------------------------------------------------------------------------
         # Unpack ------------------------------------------------------------------------------------
@@ -149,45 +181,96 @@ class Delayed_LidarState:
 
     ###################################################################################################
     # Training Loop Methods ###########################################################################
-    def step(self,action):
+    def step(self,action, return_state_inference=False):
         assert self.is_full, "Delay buffer not full before step()"
         assert action.shape == (2,), f"action shape {action.shape} does not match expected {(2,)}"
 
         self._cached_observation = None  # clear cached observation
+        info = {}
 
         # Step belief samples (Xhat_t) under new dynamics samples
         self.robot.resample_dynamics()                                  # resample robot dynamics
-        Xdelay, ahist = self.delayed_robot_state, self.action_history   # get delayed state and action history
-        Xhat_t = self.infer_curr_robot_state(Xdelay, ahist)             # Recover belief about current robot state (Xhat_t)
-        Xhat_tt = self.robot.step(Xhat_t, action, self.dt)              # Take step under dynamics samples
-        dGhat_tt, δGhat_tt = self.f_dist2goal(Xhat_tt)                  # Compute distances features
-        Lhat_tt = self.f_lidar(Xhat_tt)                                 # compute lidar features
-        shat_tt = self.compose_state(X= Xhat_tt,                        # compose new state (ensures correct idxs)
-                                     ahist = ahist.flatten(),
+        Xdelay_t, ahist_t = self.delayed_robot_state, np.copy(self.action_history)   # get delayed state and action history
+        Xinference = self.infer_robot_states(Xdelay_t, ahist_t)  # Recover belief about current robot state (Xhat_t)
+        info['X_inference'] = Xinference.copy()
+
+
+        # Compute next observation samples ---------------------
+        ahist_tt = np.vstack([ahist_t[1, :], action])
+        Xdelay_tt = Xinference[0] # Belief sample of next observation in buffer
+        Xhat_t = Xinference[-1]  # Recover belief about current robot state (Xhat_t)
+        Xhat_tt = self.robot.step(Xhat_t, action, self.dt)  # Take step under dynamics samples
+
+        Ldelay_tt = self.f_lidar(Xdelay_tt)
+
+        # Compute reward states -----------------------
+        dummy_actions = np.ones_like(ahist_t) * np.nan  # dummy actions for inference
+        dummy_lidar = np.ones_like(Ldelay_tt) * np.nan  # dummy actions for inference
+
+
+        # Batch function calls for vectorized computation
+        if return_state_inference:
+            batched_X = [Xdelay_tt, Xhat_t, Xhat_tt]
+            _dG, _δG = self.f_dist2goal(np.vstack(batched_X))
+            dGdelay_tt, dGhat_t, dGhat_tt = np.split(_dG, len(batched_X))
+            δGdelay_tt, δGhat_t, δGhat_tt = np.split(_δG, len(batched_X))
+
+            # (Reward state) current inferred state
+            info['shat_t'] = self.compose_state(X=Xhat_t,  # compose new state (ensures correct idxs)
+                                                ahist=dummy_actions.flatten(),
+                                                goal_dist=dGhat_t,
+                                                goal_heading=δGhat_t,
+                                                lidar_dists=dummy_lidar
+                                            )
+        else:
+            batched_X = [Xdelay_tt, Xhat_tt]
+            _dG, _δG = self.f_dist2goal(np.vstack(batched_X))
+            dGdelay_tt, dGhat_tt = np.split(_dG, len(batched_X))
+            δGdelay_tt, δGhat_tt = np.split(_δG, len(batched_X))
+
+            info['shat_t'] = None
+
+
+
+        # (MDP state) Next delayed observation
+        sdelay_tt = self.compose_state(X=Xdelay_tt,  # compose new state (ensures correct idxs)
+                                       ahist=ahist_tt.flatten(),
+                                       goal_dist=dGdelay_tt,
+                                       goal_heading=δGdelay_tt,
+                                       lidar_dists=Ldelay_tt
+                                       )
+        # (Reward state) next inferred state
+        info['shat_tt'] = self.compose_state(X= Xhat_tt,                        # compose new state (ensures correct idxs)
+                                     ahist = dummy_actions.flatten(),
                                      goal_dist= dGhat_tt,
                                      goal_heading = δGhat_tt,
-                                     lidar_dists = Lhat_tt
+                                     lidar_dists = dummy_lidar #Lhat_tt
                                      )
-        assert shat_tt.shape[1]== self._obs_space_dim, 'Incorrect state dim'
+
 
         # Step true state (X_t)
         X_t = self.get_curr_robot_state()                               # resample robot dynamics
         X_tt = self.robot.step_true(X_t, action, self.dt)               # get delayed state and action history
         dG_tt, δG_tt = self.f_dist2goal(X_tt)                           # Recover belief about current robot state (Xhat_t)
         L_tt = self.f_lidar(X_tt)
-        s_tt = self.compose_state(X=X_tt,                               # Take step under dynamics samples
-                                  ahist=ahist.flatten(),
+
+        # (True state) actual state of robot
+        info['s_tt'] = self.compose_state(X=X_tt,                               # Take step under dynamics samples
+                                  ahist=dummy_actions.flatten(),
                                   goal_dist=dG_tt,
                                   goal_heading=δG_tt,
-                                  lidar_dists=L_tt
+                                  lidar_dists= L_tt # not really used but have anyway
                                   )
-        assert s_tt.shape[1] == self._obs_space_dim, 'Incorrect state dim'
+
+        assert info['s_tt'].shape[1] == self._obs_space_dim, 'Incorrect state dim'
 
         self._true_robot_state = X_tt.copy().reshape(1,self.robot_state_dim)                 # update true robot state
         self._true_dist2goal_state = np.hstack([dG_tt,δG_tt]).reshape(1,self.dist_state_dim) # update true distance to goal state
         self._true_lidar_state = L_tt.reshape(1,self.lidar_state_dim)                        # update true lidar state
         self.put_buffer(X_t, action)  # put new true state and action in buffer
-        return s_tt, shat_tt
+
+
+        return sdelay_tt, info
 
     def reset(self, is_rand=False, rand_buffer=False, rand_action_gen=None):
         self._cached_observation = None
@@ -236,7 +319,7 @@ class Delayed_LidarState:
     def _get_rand_action_state(self, rand_action_gen):
         rand_actions = []
         for _ in range(self._delay_steps):
-            a = rand_action_gen(increment_decay = False)
+            a = rand_action_gen(advance = False)
             if isinstance(a, torch.Tensor):
                 a = a.cpu().numpy()
             rand_actions.append(a)
@@ -353,12 +436,30 @@ class Delayed_LidarState:
                 }
         self._rand_state_buffer.append(data)
 
+
+    def infer_robot_states(self,robot_state,actions):
+        assert self.is_valid_robot_state(robot_state,stype='single'), \
+            f"robot_state shape {robot_state.shape} does not match expected (n,4)"
+        Xt = np.repeat(robot_state, self.n_samples, axis=0)
+        Xhist = []
+
+        for action in actions:
+            # Xt = self.robot.step(Xt, action, self.dt)
+            # Xt = self.robot.step_noisy(Xt, action, self.dt)
+            Xt = self.robot.step_biased(Xt, action, self.dt)
+            Xhist.append(Xt.copy())
+        return Xhist
+
     def infer_curr_robot_state(self,robot_state,actions):
         assert self.is_valid_robot_state(robot_state,stype='single'), \
             f"robot_state shape {robot_state.shape} does not match expected (n,4)"
         Xt = np.repeat(robot_state, self.n_samples, axis=0)
+        action_bias = np.random.normal(0,self.action_noise_std,[self.n_samples,2])
+
         for action in actions:
-            Xt = self.robot.step(Xt, action, self.dt)
+            # Xt = self.robot.step(Xt, action, self.dt)
+            # Xt = self.robot.step_noisy(Xt, action, self.dt)
+            Xt = self.robot.step_biased(Xt, action, self.dt, action_bias)
         return Xt
 
     @property
@@ -396,15 +497,6 @@ class Delayed_LidarState:
         return self._true_lidar_state.copy().reshape(1, -1)
     def get_curr_dist2goal_state(self):
         return self._true_dist2goal_state.copy().reshape(1, -1)
-
-    # def get_curr_full_state(self):
-    #     return self.compose_state(X=self.get_curr_robot_state(),
-    #                               ahist=self.action_history.flatten()[np.newaxis,:],
-    #                               goal_dist=self.get_curr_dist2goal_state()[:,0],
-    #                               goal_heading=self.get_curr_dist2goal_state()[:,1],
-    #                               lidar_dists=self.get_curr_lidar_state()
-    #                               )
-
 
 
     ###################################################################################################
@@ -451,6 +543,7 @@ class EnvBase(ABC):
 
         layout_dict = read_layout_dict(layout_name)
         kwargs.update(layout_dict)
+        kwargs['layout'] = layout_name
         return cls(*args, **kwargs)
 
     def __init__(self,max_steps,dt, **kwargs):
@@ -463,42 +556,70 @@ class EnvBase(ABC):
         self.goal = None
         self.obstacles = None
         self.state = None
+        self.layout = kwargs.get('layout','unknown')
 
 
-        self.goal_velocity      = kwargs.get('goal_velocity' , 0.1)  # goal velocity          , if any
-        self.goal_radius        = kwargs.get('goal_radius'   , 0.25)  # meters
+        self.goal_velocity      = kwargs.get('goal_velocity' , 0.2)  # max goal velocity   (m/s)  , if any
+        self.goal_radius        = kwargs.get('goal_radius'   , 0.5)  # meters
         self.car_radius         = kwargs.get('car_radius'    , 0.65)  # meters
 
 
-        # self.reward_goal        = kwargs.get('reward_goal', 10.0)
-        # self.reward_collide     = kwargs.get('reward_collide', -20.0)  # penalty for collision
-        # self.reward_step        = kwargs.get('reward_step', -0.1)  # penalty for being slow
-        # self.reward_dist2goal   = kwargs.get('reward_dist', 0.2)  # maximum possible reward being close to goal
 
-        self.reward_goal = kwargs.get('reward_goal', 20.0)
-        self.reward_collide = kwargs.get('reward_collide', -50.0)  # penalty for collision
-        self.reward_step = kwargs.get('reward_step', -0.1)  # penalty for being slow
-        self.reward_dist2goal = kwargs.get('reward_dist', 0.15)  # maximum possible reward being close to goal
+        # self.reward_goal = kwargs.get('reward_goal', 100.0)
+        # self.reward_collide = kwargs.get('reward_collide', -200.0)  # penalty for collision
+        # self.reward_step = kwargs.get('reward_step', 0.00)  # penalty for being slow
+        #
+        # self.rshape = 1
+        # self.reward_dist2goal_exponent = 1.0  # exponent for distance to goal reward shaping
+        # # self.reward_dist2goal = kwargs.get('reward_dist', 0.005)  # maximum possible reward being close to goal
+        # self.reward_dist2goal = kwargs.get('reward_dist', 0.01)  # maximum possible reward being close to goal
+        # self.reward_stopping = kwargs.get('reward_stopping',  0.00)  # maximum possible reward being close to stopping to goal
 
+        self.reward_goal = REWARD_GOAL
+        self.reward_collide = REWARD_COLLIDE  # penalty for collision
+        self.reward_step = REWARD_STEP  # penalty for being slow
 
+        self.rshape = 1
+        self.reward_dist2goal_prog = REWARD_DIST2GOAL_PROG
+        self.reward_dist2goal_exponent = REWARD_DIST2GOAL_EXP # exponent for distance to goal reward shaping
+        self.reward_dist2goal = REWARD_DIST2GOAL  # maximum possible reward being close to goal
+        self.reward_stopping = REWARD_STOPPING  # maximum possible reward being close to stopping to goal
 
+        self.reward_max_step = self.reward_goal + self.reward_dist2goal + self.reward_stopping +self.reward_step
+        self.reward_min_step = self.reward_collide + self.reward_step
 
-
+        self.reward_max_run = self.reward_goal + 0 if (self.reward_dist2goal + self.reward_stopping  <= self.reward_step)\
+            else (self.reward_dist2goal + self.reward_stopping +self.reward_step)* self.max_steps
+        self.reward_min_run = self.reward_collide + (self.reward_step) * self.max_steps
         # Reward Consistency Checks
         gamma = 0.99
-        discounted = np.power(gamma, np.arange(self.max_steps))
-        # exp_cum_reward_dist2goal = np.sum(self.reward_dist2goal/2  * discounted)
-        exp_cum_reward_dist2goal = np.sum(self.reward_dist2goal  * discounted)
-        exp_cum_reward_step = np.sum(self.reward_step * discounted)
+        inf_sum = 1 / (1 - gamma)
+        exp_cum_reward_dist2goal    = self.reward_dist2goal*inf_sum
+        exp_cum_reward_step         = self.reward_step *inf_sum
+
+        cum_reward_dist2goal = self.max_steps*self.reward_dist2goal
+        cum_reward_step =  self.max_steps*self.reward_step
 
 
-        buff = 1
-        assert abs(exp_cum_reward_step) < abs(exp_cum_reward_dist2goal), f'Avoiding Timecost is Worse than Getting Closer: '
-        assert buff * abs(exp_cum_reward_step)< abs(self.reward_collide), f'Crashing Always Worse than Slow'
-        assert abs(exp_cum_reward_dist2goal) < abs(self.reward_collide), f'Crashing Always Worse than Close:'
-        assert abs(buff * exp_cum_reward_dist2goal + exp_cum_reward_step) < abs(self.reward_goal), f'Goal Always Better than Close:'
 
+        assert self.reward_collide < cum_reward_step, f'REWARD VIOLATION: Crashing < Slow'
+        assert self.reward_collide < exp_cum_reward_step, f'REWARD VIOLATION: Crashing < Slow'
+        if not self.reward_dist2goal_prog:
+            assert self.reward_goal > cum_reward_dist2goal + cum_reward_step, f'REWARD VIOLATION: Goal Always Better than Close:'
+            assert self.reward_goal > exp_cum_reward_dist2goal + exp_cum_reward_step, f'REWARD VIOLATION: Goal Always Better than Close:'
 
+        # assert self.reward_collide
+        #
+        # buff = 1
+        # # assert abs(exp_cum_reward_step) < abs(exp_cum_reward_dist2goal), f'REWARD VIOLATION: Avoiding Slow < Getting Closer: '
+        # assert buff * abs(exp_cum_reward_step)< abs(self.reward_collide), f'REWARD VIOLATION: Crashing < Slow'
+        # assert abs(exp_cum_reward_step) < abs(self.reward_collide), f'REWARD VIOLATION: Crashing < Waiting'
+        # assert abs(exp_cum_reward_dist2goal) < abs(self.reward_collide), f'REWARD VIOLATION: Crashing < Close:'
+        # # assert abs(buff * exp_cum_reward_dist2goal + exp_cum_reward_step) < abs(self.reward_goal), f'REWARD VIOLATION: Goal Always Better than Close:'
+        #
+        # assert abs(cum_reward_dist2goal + cum_reward_step) < abs(self.reward_goal), f'REWARD VIOLATION: Goal Always Better than Close:'
+        # assert abs(cum_reward_step) < abs(self.reward_collide), f'REWARD VIOLATION: Crashing < Waiting'
+        # assert abs(cum_reward_dist2goal) < abs(self.reward_collide), f'REWARD VIOLATION: Crashing < Close:'
 
     @abstractmethod
     def step(self, *args, **kwargs):
@@ -508,9 +629,11 @@ class EnvBase(ABC):
         pass
 
     def render(self, ax=None,
-               draw_robot=True, draw_obstacles=True,
+               draw_robot=True, draw_robot_asimg=True,
+               draw_obstacles=True, draw_collision_box=True,
                draw_goal=True, draw_dist2goal=True,
-               draw_lidar=True, pause=None):
+               draw_lidar=True, pause=None,
+               draw_delayed=False):
         obs_alpha= 1
         goal_alpha = 0.5
 
@@ -527,17 +650,53 @@ class EnvBase(ABC):
         self.ax.set_aspect('equal', adjustable='box')
 
         # Draw assets
+        if draw_collision_box: self.draw_collision_box(self.ax)
         if draw_obstacles: self.draw_obstacles(self.ax)
         if draw_goal     : self.draw_goal(self.ax)
-        if draw_robot    : self.draw_robot(self.ax)
-        if draw_dist2goal: self.draw_dist2goal(self.ax)
-        if draw_lidar    : self.draw_lidar(self.ax)
+        if draw_robot    : self.draw_robot(self.ax, draw_delayed= draw_delayed,draw_robot_asimg=draw_robot_asimg)
+        if draw_dist2goal: self.draw_dist2goal(self.ax, draw_delayed= draw_delayed)
+        if draw_lidar    : self.draw_lidar(self.ax, draw_delayed= draw_delayed)
 
         plt.draw()
         if pause is not None:
             plt.pause(pause)
 
-    def draw_robot(self,ax, image_path = "src/env/assets/fetch_robot.png"):
+
+    def draw_collision_box(self,ax,  alpha=0.05, c = 'r'):
+        import shapely
+        import shapely.geometry as sg
+        import shapely.ops as so
+        import matplotlib.pyplot as plt
+
+        polys = []
+        for obs in self.obstacles:
+            if obs['type'] == 'circle':
+                # circle = plt.Circle(tuple(obs['center']), obs['radius']+ self.car_radius, color=c, alpha=alpha)
+                center_point = sg.Point(*obs['center'])
+                circular_polygon = center_point.buffer( obs['radius']+ self.car_radius)
+                polys.append(circular_polygon)
+
+            else:
+                cx, cy = obs['center']
+                w, h = obs['width'], obs['height']
+                rect = sg.box(  cx - w / 2 - self.car_radius,
+                                cy - h / 2 - self.car_radius,
+                                cx + w / 2 + self.car_radius,
+                                cy + h / 2 + self.car_radius)
+                polys.append(rect)
+
+
+        # Plot singular union
+        for i in range(len(polys)):
+            _poly = polys[i]
+            for j in range(i+1, len(polys)):
+                _poly = _poly.difference(polys[j])
+            xs, ys = _poly.exterior.xy
+            ax.fill(xs, ys, alpha=alpha, fc=c, ec='none')
+
+    def draw_robot(self,ax, draw_robot_asimg=True,
+                   draw_delayed=False, alpha=1.0,
+                   image_path = "src/env/assets/fetch_robot.png"):
         """insert image of robot from ./assets/fetch_robot.png"""
         project_root = get_project_root()
 
@@ -549,8 +708,17 @@ class EnvBase(ABC):
         arrow_color = 'b'
 
 
-        x, y, v, θ = self.state.get_curr_robot_state().flatten()
+        x, y, v, θ = self.state.get_curr_robot_state().flatten() if not draw_delayed \
+            else self.state.delayed_robot_state.flatten()
 
+
+
+        if not draw_robot_asimg:
+            # draw circle with radius self.car_radius
+            circle = plt.Circle((x, y), self.car_radius, color='b', alpha=alpha)
+            ax.add_patch(circle)
+            # ax.scatter(x, y, color='k', alpha=alpha,zorder=99)
+            return
 
         # Add arrow to indicate direction
         dx = arrow_len * np.cos(θ)
@@ -575,16 +743,12 @@ class EnvBase(ABC):
             transform=t,
             zorder=3,
             interpolation="bilinear",
+            alpha=alpha
         )
 
 
-        # car = plt.Circle((self.x, self.y), self.car_radius, color='blue')
-        # ax.add_patch(car)
-        # dx = arrow_len * np.cos(self.θ)
-        # dy = arrow_len * np.sin(self.θ)
-        # ax.arrow(self.x, self.y, dx, dy, head_width=arrow_width, color='black')
 
-    def draw_goal(self, ax, goal_alpha= 1.0):
+    def draw_goal(self, ax, goal_alpha= 0.7):
         goal_circle = plt.Circle(tuple(self.goal), self.goal_radius, color='green', alpha=goal_alpha)
         ax.add_patch(goal_circle)
 
@@ -599,18 +763,23 @@ class EnvBase(ABC):
                 rect = plt.Rectangle((cx - w/2, cy - h/2), w, h, color='k', alpha=obs_alpha)
                 ax.add_patch(rect)
 
-    def draw_dist2goal(self, ax):
-        x, y, v, θ = self.state.get_curr_robot_state().flatten()
-        dGoal, δGoal = self.state.get_curr_dist2goal_state().flatten()
+    def draw_dist2goal(self, ax, draw_delayed=False):
+        x, y, v, θ = self.state.get_curr_robot_state().flatten() if not draw_delayed \
+            else self.state.delayed_robot_state.flatten()
+        dGoal, δGoal = self.state.get_curr_dist2goal_state().flatten() if not draw_delayed \
+            else np.array(self.state.f_dist2goal(self.state.delayed_robot_state)).flatten()
 
         # Line to goal
         gx = x + dGoal * np.cos(δGoal + θ)
         gy = y + dGoal * np.sin(δGoal + θ)
         ax.plot([x, gx], [y, gy], 'g--', label='to goal')
 
-    def draw_lidar(self,ax):
-        x, y, v, θ = self.state.get_curr_robot_state().flatten()
-        L = self.state.get_curr_lidar_state().flatten()
+    def draw_lidar(self,ax, draw_delayed=False):
+        x, y, v, θ = self.state.get_curr_robot_state().flatten() if not draw_delayed \
+            else self.state.delayed_robot_state.flatten()
+        L = self.state.get_curr_lidar_state().flatten() if not draw_delayed \
+            else np.array(self.state.f_lidar(self.state.delayed_robot_state)).flatten()
+
         for i, δbeam in enumerate(self.state.lidar_angles):
             ray_angle = θ + δbeam
             dlidar = L[i]# eval(f'self.state.lidar{i}')
@@ -646,7 +815,7 @@ class EnvBase(ABC):
                 # dGoal, δGoal = self.nav_state.get_dist2goal_sphere(x, y, 0)  # distances to goal and obstacles
                 rew = 0
                 if r_dist2goal:
-                    rew_dist2goal = self.reward_dist2goal * (1 - (dGoal / self.max_dist))  # progress towards goal reward
+                    rew_dist2goal = self.reward_dist2goal * (1 - (dGoal / self.max_dist))**self.reward_dist2goal_exponent  # progress towards goal reward
                     rew +=  rew_dist2goal
                 if r_collision:
                     rew_collision = self._check_collision(X) * self.reward_collide
@@ -776,7 +945,10 @@ class ContinousNavEnv(EnvBase):
                  dt                = 0.1,
                  delay_steps       = 3,
                  max_steps         = 600, # 60 sec
-                 vgraph_resolution = 30,#(30, 30),
+                 vgraph_resolution = 10,#(30, 30),
+                 verbose = True,
+                 time_is_terminal = False,
+                 goal_is_terminal = True,
                  **kwargs
                  ):
         super().__init__(max_steps, dt, **kwargs) # contains default vals that do not need to be changed
@@ -792,6 +964,7 @@ class ContinousNavEnv(EnvBase):
         self.goal      = tuple(goal)
         self.obstacles = self.format_obstacles(obstacles)
         self.obstacles = self.create_boarder_obstacles(self.obstacles)  # add borders to the environment
+        self.verbose = verbose
 
         # Action parameters ------------------------------------------------------------------------------------------
         self.action_bounds = {}
@@ -805,12 +978,14 @@ class ContinousNavEnv(EnvBase):
         # State parameters ------------------------------------------------------------------------------------------
         self.steps = 0
         self.done = False  # flag to indicate if the episode is done
+        self.time_is_terminal = time_is_terminal # if True, reaching max_steps triggers done
+        self.goal_is_terminal = goal_is_terminal # if True, reaching goal triggers done
 
         self.vgraph_resolution = vgraph_resolution
-        vgraph = VisibilityGraph(self.goal, self.obstacles, self.bounds, resolution=vgraph_resolution )
+        vgraph = VisibilityGraph(self.goal, self.obstacles, self.bounds, resolution=vgraph_resolution, verbose=self.verbose)
         self.max_dist = vgraph.max_dist
         f_dist2goal = vgraph.get_compiled_funs()
-        f_lidar = Compiled_LidarFun(self.obstacles, kwargs.get('n_rays', 10))
+        f_lidar = Compiled_LidarFun(self.obstacles, kwargs.get('n_rays', 12))
         self.state = Delayed_LidarState(X0, f_dist2goal, f_lidar, delay_steps, dt,
                                         bounds=self.bounds,
                                         robot_state_validator = self._check_collision,
@@ -842,15 +1017,22 @@ class ContinousNavEnv(EnvBase):
         true_info = {}
         infos = {}
 
-        s_tt,shat_tt = self._resolve_action(action) # State transition
+        # s_tt,shat_tt = self._resolve_action(action) # State transition
+        sdelay_tt, info = self._resolve_action(action, return_state_inference=self.reward_dist2goal_prog) # State transition
+        shat_tt = info['shat_tt']
+        shat_t = info['shat_t']
+        s_tt = info['s_tt']
+        master_info['X_inference'] = info['X_inference']
 
         # Compute sampled transition
         dones, infos = self._resolve_terminal_state(shat_tt, infos)  # check reach goal or collision
-        rewards, infos = self._resolve_rewards(shat_tt, infos)  # compute rewards
+        rewards, infos = self._resolve_rewards(shat_tt, infos, shat_t)  # compute rewards
+
         master_info['sampled_dones'] = dones
         master_info['sampled_rewards'] = rewards
         master_info['sampled_next_states'] = shat_tt
         master_info['sampled_reasons'] = infos['reason']
+        master_info['rew_dist2goal'] = infos['rew_dist2goal']
 
         # Compute true transition
         true_done, true_info = self._resolve_terminal_state(s_tt, true_info) # check reach goal or collision
@@ -862,9 +1044,11 @@ class ContinousNavEnv(EnvBase):
         master_info['true_reason'] = true_info['reason']
 
         _done = self.done if true_done else dones
-        return shat_tt, rewards, _done, master_info
+
+        return sdelay_tt, rewards, _done, master_info
 
     def reset(self,p_rand_state=0, **kwargs):
+        info = {}
         self.steps = 0
         is_rand = (np.random.rand() < p_rand_state)
         for attempt in range(kwargs.get('rand_attempts',50)):
@@ -878,9 +1062,10 @@ class ContinousNavEnv(EnvBase):
             col_dones = self._check_collision(self.state._true_robot_state.reshape(1, -1))
 
         assert not np.any(col_dones), 'invalid reset state (starts in collision)'
-
-    def _resolve_action(self, action):
-        return self.state.step(action) # State transition
+        info['is_rand'] = is_rand
+        return info
+    def _resolve_action(self, action, **kwargs):
+        return self.state.step(action,**kwargs) # State transition
 
     def _resolve_terminal_state(self, states, info):
         assert states.ndim == 2, f"states should be 2D array, got shape {states.shape}"
@@ -897,7 +1082,10 @@ class ContinousNavEnv(EnvBase):
         for i in np.where(time_dones == 1)[0]: _info['reason'][i] = 'max_steps'
         for i in np.where(goal_dones == 1)[0]: _info['reason'][i] = 'goal_reached'
         for i in np.where(col_dones  == 1)[0]: _info['reason'][i] = 'collision'
-        dones += col_dones + goal_dones + time_dones
+
+        dones += col_dones
+        dones += goal_dones if self.goal_is_terminal else 0
+        dones += time_dones if self.time_is_terminal else 0
         dones = np.clip(dones, 0, 1)
 
         if n == 1:
@@ -922,13 +1110,33 @@ class ContinousNavEnv(EnvBase):
                 cx, cy = obs['center']
                 w, h = obs['width'], obs['height']
                 x, y = xy
-                is_inside = (cx - w / 2 <= x) & (x <= cx + w / 2) & (cy - h / 2 <= y) & (y <= cy + h / 2)
+                # is_inside = (cx - w / 2 <= x) & (x <= cx + w / 2) & (cy - h / 2 <= y) & (y <= cy + h / 2)
+                is_inside = (cx - w / 2 - self.car_radius <= x) &\
+                            (x <= cx + w / 2 + self.car_radius) & \
+                            (cy - h / 2 - self.car_radius <= y) & \
+                            (y <= cy + h / 2 + self.car_radius)
                 assert is_inside.shape == dones.shape,  f"{is_inside.shape} vs {dones.shape}"
                 dones += is_inside
 
         dones = np.clip(dones, 0, 1)
         return dones
 
+    def render(self,*args,ns_prospects=None,**kwargs):
+        pause = kwargs.pop('pause', None)
+        super().render(*args, **kwargs)
+
+        if ns_prospects is not None:
+            x, y = ns_prospects[:,0], ns_prospects[:,1]
+            if ns_prospects.shape[1] ==3:
+                p = ns_prospects[:,2]
+                # make p range from [0.1, 1]
+                p = (p - np.min(p)) / (np.max(p) - np.min(p) + 1e-6)
+                alpha = np.clip(p,0.1,1.0)
+            self.ax.scatter(x, y, color='orange', s=3, alpha= alpha)
+
+        plt.draw()
+        if pause is not None:
+            plt.pause(pause)
 
     def _check_goal(self, states):
         """Checks if the robot has reached the goal"""
@@ -936,19 +1144,15 @@ class ContinousNavEnv(EnvBase):
         n_samples = states.shape[0]
         dones = np.zeros(n_samples)
 
-        # Get relevant vars and reshape
-        goal_rad = np.array([self.goal_radius]).reshape(1,1)
-        goal_v = np.array([self.goal_velocity]).reshape(1,1)
-        goal_xy = np.array(self.goal, dtype=np.float32).reshape(1,2)
-
-        # xy = np.hstack([states[:, self.state.ix], states[:, self.state.iy]], dtype=np.float32).reshape(n_samples,2)
-        xy = states[:, :2]
-        v = states[:, self.state.iv].reshape(n_samples,1)
-
         # Perform checks
-        dist_to_goal = np.linalg.norm(xy - goal_xy, axis=1).reshape(n_samples,1)
-        is_inside = np.array(dist_to_goal <= goal_rad, dtype=int)
-        is_stopped = np.array(v <= goal_v,dtype=int)
+        # dist_to_goal = np.linalg.norm(xy - goal_xy, axis=1).reshape(n_samples,1)
+        # is_inside = np.array(dist_to_goal <= goal_rad, dtype=int)
+
+
+        goal_v = np.array([self.goal_velocity]).reshape(1, 1)
+        v = np.abs(states[:, self.state.iv].reshape(n_samples, 1))
+        is_stopped = np.array(np.abs(v) <= goal_v,dtype=int)
+        is_inside = self._check_inside_goal(states)
         assert is_inside.shape == is_stopped.shape
 
         # Combine checks and return
@@ -956,23 +1160,66 @@ class ContinousNavEnv(EnvBase):
         dones = np.clip(dones, 0, 1)
         return dones
 
-    def _resolve_rewards(self, state_samples, info):
+
+    def _check_inside_goal(self, states):
+        n_samples = states.shape[0]
+
+        # Get relevant vars and reshape
+        goal_rad = np.array([self.goal_radius]).reshape(1, 1)
+        goal_xy = np.array(self.goal, dtype=np.float32).reshape(1, 2)
+        xy = states[:, :2]
+
+        # Perform checks
+        dist_to_goal = np.linalg.norm(xy - goal_xy, axis=1).reshape(n_samples, 1)
+        is_inside = np.array(dist_to_goal <= goal_rad, dtype=int)
+        return is_inside
+
+    def _resolve_rewards(self, state_samples, info, prev_state_samples = None):
         """
         Resolve the reward based on the previous and new state.
         """
         n = state_samples.shape[0]
         rewards = np.zeros(n)
 
+        # Distance to goal shaped reward
         dGoal = state_samples[:,self.state.idGoal]
-        rew_dist2goal = self.reward_dist2goal * (1 - (dGoal / self.max_dist))  # progress towards goal reward
+        rew_scale = np.power(1 - (dGoal / self.max_dist), self.reward_dist2goal_exponent)
+        rew_scale = np.clip(rew_scale, 0.0, 1.0)
+        # assert np.all(rew_scale <= 1.0) and np.all(rew_scale >= 0.0), f"rew_scale out of bounds: {rew_scale}"
+        rew_dist2goal = self.reward_dist2goal * rew_scale
         info['rew_dist2goal'] = rew_dist2goal
+
+        if prev_state_samples is not None:
+            dGoal_prev = prev_state_samples[:,self.state.idGoal]
+            rew_scale = np.power(1 - (dGoal_prev / self.max_dist), self.reward_dist2goal_exponent)
+            rew_dist2goal_prev = self.reward_dist2goal * rew_scale
+            rew_dist2goal = np.power(rew_dist2goal - rew_dist2goal_prev,1)  # reward is the progress towards goal
+            # rew_dist2goal = np.clip(rew_dist2goal, self.reward_dist2goal, self.reward_dist2goal)
+            info['rew_dist2goal'] = rew_dist2goal
+
+        # Stopping in goal shaped reward
+        if self.reward_stopping > 0:
+            is_inside = self._check_inside_goal(state_samples)
+            goal_v = np.array([self.goal_velocity]).reshape(1, 1)
+            v = state_samples[:, self.state.iv].reshape(n, 1)
+            dv = np.max(np.hstack([np.abs(v) - goal_v, np.zeros_like(v)]), axis=1)
+            max_vel = self.state.robot.true_max_lin_vel
+            rew_stopping = is_inside.flatten() * self.reward_stopping * (1 - (dv / max_vel))**2
+        else:
+            rew_stopping = np.zeros(n)
+
+        assert rew_stopping.shape == rewards.shape
         assert rew_dist2goal.shape == rewards.shape
 
-        rewards += rew_dist2goal   # progress towards goal reward
-        rewards += self.reward_step  # time cost
-        rewards += (info['reason'] == 'collision')      * self.reward_collide
-        rewards += (info['reason'] == 'goal_reached')   * self.reward_goal
+        rewards += rew_dist2goal * self.rshape  # progress towards goal reward
+        rewards += rew_stopping * self.rshape
+        rewards += self.reward_step #* self.rshape  # time cost
+        rewards += (np.array(info['reason']) == 'collision')      * self.reward_collide
+        rewards += (np.array(info['reason']) == 'goal_reached')   * self.reward_goal
 
+        # Sanity check
+        # assert np.all(rewards <= self.reward_max_step), f"Rewards out of max bounds: {rewards[rewards >= self.reward_min_step]}"
+        # assert np.all(rewards >= self.reward_min_step), f"Rewards out of min bounds: {rewards[rewards <= self.reward_min_step]}"
         return rewards, info
 
     @property
@@ -1021,27 +1268,119 @@ class ContinousNavEnv(EnvBase):
         s += f"\n"
         return s
 
-def main_vec():
+
+def preview_action_samples(ax, env, action, block = True):
+    ns_samples, r_samples, done_samples, info = env.step(action)
+    p_samples = np.array(env.robot_probs)
+    p_samples = np.array(p_samples).reshape(ns_samples.shape[0], 1)
+    # ns_prospects = np.hstack([ns_samples[:,0:2], p_samples])  # for rendering
+    ns_prospects = np.hstack([info['sampled_next_states'][:, 0:2], p_samples])  # for rendering
+    env.render(ns_prospects=ns_prospects,
+               draw_delayed=True,
+               draw_robot=True,
+               draw_robot_asimg=False,
+               draw_dist2goal=False,
+               draw_lidar=False,
+               ax=ax,
+               pause=0.001)
+
+    x,y = info['true_next_state'][0,0:2]
+    ax.scatter(x, y, color='red', s=5, marker='x', label='True Next State')
+
+    # if block:
+    #     plt.ioff()
+    #     plt.show()
+
+
+def main_preview():
+    """Usefull for tuning dynamics"""
+    layout = 'spath'
+    vgraph_resolution = 50
+    P_RAND_STATE = 0
+    actions = [[0, 1.0],
+               [-0.5, 1.0],
+               [-1.0, 1.0]]
+    delay_steps = 10
+    V0 = 1.0
+
+    dynamics_belief = {
+        'b_min_lin_vel': (0.0, 1e-6),
+        'b_max_lin_vel': (1.5, 0.5),
+        'b_max_lin_acc': (0.5, 0.2),
+        'b_max_rot_vel': (math.pi / 2.0, math.pi / 6.0)
+        # 'b_min_lin_vel': (0.0, 1e-6),
+        # 'b_max_lin_vel': (1.5, 1e-6),
+        # 'b_max_lin_acc': (0.5, 1e-6),
+        # 'b_max_rot_vel': (math.pi / 2.0, 1e-6)
+    }
+    env = ContinousNavEnv.from_layout(layout,
+                                      dynamics_belief=dynamics_belief,
+                                      delay_steps=delay_steps,
+                                      vgraph_resolution=vgraph_resolution)
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    env.state._X0[env.state.iv] = V0  # set to max vel initially
+
+    for i, action in enumerate(actions):
+        env.reset(p_rand_state=P_RAND_STATE)
+        # env._true_robot_state[2] = 1.5
+
+        # Fill buffer -----------------
+        xy_hist = np.empty((0,2), dtype=np.float32)
+
+        for _ in range(delay_steps + 1):
+            action = np.array(action, dtype=np.float32)  # Use joystick input as action
+            ns_samples, r_samples, done_samples, info = env.step(action)
+            p_samples = np.array(env.robot_probs)
+            p_samples = np.array(p_samples).reshape(ns_samples.shape[0], 1)
+            # true_state_hist.append(env.state._true_robot_state[0:2].copy())
+
+            xy_hist = np.vstack([xy_hist, env.state._true_robot_state[0,0:2].reshape(1,2)])
+
+
+        x,y = xy_hist[:,0], xy_hist[:,1]
+        preview_action_samples(ax[i], env, action)
+        ax[i].scatter(x,y, color='red', s=5, marker='x', label='True Next State')
+        ax[i].set_title(f'Action: {action}')
+        print(f'_true_robot_state.shape = {env.state._true_robot_state}')
+
+
+    plt.ioff()
+    plt.show()
+
+
+def main_simulate():
     from utils.joystick import VirtualJoystick
     import time
 
-    layout =  'example2'
+    layout =  'spath'
+    vgraph_resolution = 50
     P_RAND_STATE = 1
 
-    env = ContinousNavEnv.from_layout(layout)
-
-    #
-    # env.step(np.array([0.5, 0.5]))
-    # print(env.state.get_curr_lidar_state())
-    # env.render()
-    # plt.show(block=True)
+    dynamics_belief =  {
+        # 'b_min_lin_vel': (-0.1, 1e-6),
+        # 'b_max_lin_vel': (1.0, 1e-6),
+        # 'b_max_lin_acc': (0.5, 1e-6),
+        # 'b_max_rot_vel': (np.pi / 4, 1e-6)
+        'b_min_lin_vel': (0.0, 1e-6),
+        'b_max_lin_vel': (1.5, 0.5),
+        'b_max_lin_acc': (0.5, 0.2),
+        'b_max_rot_vel': (math.pi / 2.0, math.pi / 6.0)
+        # 'b_min_lin_vel': (-0.1, 1e-6),
+        # 'b_max_lin_vel': (1.0, 0.25),
+        # 'b_max_lin_acc': (0.5, 0.1),
+        # 'b_max_rot_vel': (np.pi / 4, 0.1 * np.pi)
+    }
+    delay_steps = 10
+    env = ContinousNavEnv.from_layout(layout,dynamics_belief=dynamics_belief,delay_steps=delay_steps,vgraph_resolution=vgraph_resolution)
 
     fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    # env.render_reward_heatmap(ax=axs[0], r_collision=False, r_dist2goal=True ,r_goal=False,draw_obstacles=True,show_colorbar=True, block=False)
+    env.render_reward_heatmap(ax=axs[0], r_collision=False, r_dist2goal=True ,r_goal=False,draw_obstacles=True,show_colorbar=True, block=False)
     # env.render_reward_heatmap(ax=axs[1], r_collision=False, r_dist2goal=True ,r_goal=True,draw_obstacles=True,show_colorbar=True, block=False)
     # env.render_reward_heatmap(ax=axs[2], r_collision=True, r_dist2goal=True ,r_goal=True,draw_obstacles=False,show_colorbar=True, block=True)
 
 
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
     joystick = VirtualJoystick(ax=axs[0], deadzone=0.05, smoothing=0.35, spring=True)
     axs[-1].set_title("Virtual Joystick Input")
 
@@ -1051,24 +1390,50 @@ def main_vec():
     total_reward = 0.0
     rewards = []
     done = False
+    rew_line = None
     print(f'Beginning Simulation...')
+    loop_durs = deque(maxlen=10)
     while not done:
         tstart = time.time()
         x, y, r, th, active = joystick.get()
         action = np.array([x, y], dtype=np.float32)  # Use joystick input as action
         ns_samples, r_samples, done_samples, info = env.step(action)
+        p_samples =  np.array(env.robot_probs)
+        p_samples = np.array(p_samples).reshape(ns_samples.shape[0],1)
+        # ns_prospects = np.hstack([ns_samples[:,0:2], p_samples])  # for rendering
+        ns_prospects = np.hstack([info['sampled_next_states'][:,0:2], p_samples])  # for rendering
+
+
+
         reward = info['true_reward']
         rewards.append(reward)
         if len(rewards) > 2:
-            axs[-1].plot(rewards)
+            if rew_line is None:
+                rew_line, = axs[-1].plot(rewards)
+            else:
+                rew_line.set_ydata(rewards)
+                rew_line.set_xdata(np.arange(len(rewards)))
             axs[-1].relim()
 
         total_reward += reward
-        env.render(draw_dist2goal=True, draw_lidar=True, ax=axs[1],pause=0.001)
-        # plt.show(block=False)
-        while time.time() - tstart < env.dt:
-            pass
 
+        env.render(ns_prospects= ns_prospects,
+                   draw_delayed=True,
+                   draw_robot=True,
+                   draw_robot_asimg=False,
+                   draw_dist2goal=False,
+                   draw_lidar=False,
+                   ax=axs[1],
+                   pause=0.001)
+        # plt.show(block=False)
+
+        loop_dur =time.time() - tstart
+        while loop_dur < env.dt:
+            loop_dur =time.time() - tstart
+        loop_durs.append(loop_dur)
+        print(f'')
+        print(reward)
+        print(f'Loop dur: {np.mean(loop_durs).round(2)}, rew_dist2goal: {np.mean(info["rew_dist2goal"])}')
         if info['true_done']:
             obs = env.reset(p_rand_state=P_RAND_STATE)
 
@@ -1080,4 +1445,5 @@ def main_vec():
 
 
 if __name__ == "__main__":
-   main_vec()
+   # main_simulate()
+   main_preview()

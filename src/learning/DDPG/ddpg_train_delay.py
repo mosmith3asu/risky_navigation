@@ -1,32 +1,33 @@
 import matplotlib.pyplot as plt
 import numpy as np
-
+import math
 from learning.DDPG.ddpg_agent import DDPGAgent_EUT
 from src.env.continous_nav_env_delay_comp import ContinousNavEnv
 
-def main(layout, MAX_EPIS = 1_000):
+def main(layout, MAX_EPIS = 3_000):
 
 
 
     env_config = {}
+
+    env_config = {}
     env_config['dynamics_belief'] = {
-        # 'b_min_lin_vel': (0, 1e-6),
-        # 'b_max_lin_vel': (1.0, 0.5),
-        # 'b_max_lin_acc': (0.5, 0.2),
-        # 'b_max_rot_vel': (np.pi / 4, 0.2 * np.pi)
         'b_min_lin_vel': (0.0, 1e-6),
-        'b_max_lin_vel': (1.0, 1e-6),
-        'b_max_lin_acc': (0.5, 1e-6),
-        'b_max_rot_vel': (np.pi / 4, 1e-6)
+        'b_max_lin_vel': (1.5, 0.5),
+        'b_max_lin_acc': (0.5, 0.2),
+        'b_max_rot_vel': (math.pi / 2.0, math.pi / 6.0)
+        # 'b_min_lin_vel': (0.0, 1e-6),
+        # 'b_max_lin_vel': (1.0, 1e-6),
+        # 'b_max_lin_acc': (0.5, 1e-6),
+        # 'b_max_rot_vel': (np.pi / 4, 1e-6)
     }
 
     env_config['dt'] = 0.1
     env_config['delay_steps'] = 10 # (two-way delay)  delay_time = delay_steps * dt
-    env_config['n_samples'] = 50
+    env_config['n_samples'] = 500
     env_config['vgraph_resolution'] = 50
     env_config['max_steps'] = 600
-    # env_config['action_bounds_x'] = [-1, 1]
-    # env_config['action_bounds_y'] = [0, 1]
+
 
     # OG Config
     agent_config = {
@@ -42,8 +43,8 @@ def main(layout, MAX_EPIS = 1_000):
 
         'update_interval': 2,
 
-        'warmup_epis': 100,
-        # 'warmup_epis': 5,
+        # 'warmup_epis': 100,
+        'warmup_epis': 1,
         'rand_start_sched':{
             'xstart': 0.8,
             'xend': 0.1,
@@ -55,14 +56,20 @@ def main(layout, MAX_EPIS = 1_000):
         'ou_noise': {
                 'theta': 0.1,
                 'sigma': 0.5,
-                'sigma_decay': 0.995,
                 'sigma_min': 0.05,
-                'decay_freq': int(env_config['max_steps']/2 )
+                'mode': 'exponential',
+                'exp_gain': 2.0,
+                'horizon': 0.75*MAX_EPIS,
         }
     }
 
+
+    env_config['max_steps'] = 200
+
+
     env = ContinousNavEnv.from_layout(layout, **env_config)
     agent = DDPGAgent_EUT(env, **agent_config)
+    # agent.ou.plot(T=MAX_EPIS*1.1)
 
     print(agent)
     agent.train(max_episodes=MAX_EPIS)
@@ -101,7 +108,9 @@ def validation():
         'grad_clip': 0.75,
         'update_interval': 1,
 
-        'warmup_epis': 10,
+        # 'warmup_epis': 10,
+        'warmup_epis': 1,
+
         'rand_start_sched':{
             'xstart': 0.1,
             'xend': 0.05,
@@ -128,7 +137,7 @@ def validation():
     plt.show()
 
 if __name__ == '__main__':
-    main('example2')
+    main('spath')
     # validation()
 
 

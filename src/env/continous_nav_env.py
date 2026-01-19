@@ -658,7 +658,7 @@ class ContinuousNavigationEnvBase(gym.Env):
         # dy = arrow_len * np.sin(self.θ)
         # ax.arrow(self.x, self.y, dx, dy, head_width=arrow_width, color='black')
 
-    def draw_goal(self, ax, goal_alpha= 1.0):
+    def draw_goal(self, ax, goal_alpha= 0.7):
         goal_circle = plt.Circle(tuple(self.goal), self.goal_radius, color='green', alpha=goal_alpha)
         ax.add_patch(goal_circle)
 

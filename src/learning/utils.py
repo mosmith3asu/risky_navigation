@@ -2,614 +2,408 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import warnings
+from matplotlib.table import Table
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import math
 
-from scipy.stats import norm
-from scipy.stats import multivariate_normal
-####################################################################
-### Risk-Sensitivity ###############################################
-####################################################################
-class CumulativeProspectTheory:
-    """
-    https://github.com/cvxgrp/cptopt/blob/master/cptopt/utility.py
-    """
-    def __init__(self):
-        pass
+class Logger:
+    def __init__(self, env, fig_title='', start_time_str='',reset_params={}):
+        self.env = env
+        self.fig_title = fig_title
+        self.fig, self.axes = None, None
+        self.fig_assets = {}
+        self.start_time_str = start_time_str
+        self.reset_params = reset_params
 
-    # Utility Functions ###########################
-    def u_plus(self,o, power=0.85):
-        return o ** power
+    def _spawn_figure(self, max_title_chars=100):
+        from textwrap import wrap
 
-    def u_minus(self, o, power=0.85, loss_aversion=2):
-        return -loss_aversion * np.abs(o) ** power
+        plt.ion()
 
-    def u(self,o, power=0.85, loss_aversion=2):
-        if o >= 0:
-            return self.u_plus(o, power)
-        else:
-            return self.u_minus(o, power, loss_aversion)
+        # Create a figure
+        self.fig = plt.figure(figsize=(12, 6), constrained_layout=True)
+        self.fig.suptitle(
+            '\n'.join(wrap(self.fig_title + self.start_time_str, max_title_chars))
+            # self.fig_title + f' ({self.start_time_str})'
+        )
 
-    # Probability Weighting ###########################
-    def w(self,p,alpha,delta=0.75):
-        return np.exp(-alpha*(-np.log(p))**delta)
-    # CPT-Value Difference function ##########
-    def f(self,p, b, a, la, cc):
-        psi_R = self.w(p, a) if R - b > 0 else 1 - self.w(1 - p, a)
-        psi_S = self.w(1 - p, a) if S - b > 0 else 1 - self.w(p, a)
-        return self.u(self.R - b, cc, la) * psi_R + self.u(S - b, cc, la) * psi_S - self.u(T - b, cc, la)
+        gs = gridspec.GridSpec(3, 2, width_ratios=[1, 2], height_ratios=[1, 1, 0.75], figure=self.fig)
 
-def quantile_expectation(
-        samples,
-        weight_fn=None,
-        axis=-1,
-        keepdims=False,
-        validate=False
-):
-    """
-    Quantile-based expectation from samples.
+        # Left column: 3 stacked axes
+        self.rew_ax = self.fig.add_subplot(gs[0, 0])
+        self.loss_ax = self.fig.add_subplot(gs[1, 0])
+        self.sched_ax = self.fig.add_subplot(gs[2, 0])
 
-    Computes  ∫_0^1 Q_X(u) d w(u)  using the empirical quantile function Q_X
-    (order statistics) and Riemann–Stieltjes sum:
-        E_w[X] ≈ Σ_{i=1}^n x_(i) * ( w(i/n) - w((i-1)/n) ),
-    where x_(i) are the sorted samples along `axis`.
+        # format last axis differently
+        # for ax in [self.rew_ax, self.loss_ax]:
+        #     ax.set_xticks([])
+        #     ax.set_xticklabels([])
+        self.sched_ax.set_xlabel('Episode')
 
-    Parameters
-    ----------
-    samples : array_like
-        Sample values. Can be 1D or ND; `axis` selects the sample dimension.
-    weight_fn : callable(u)->float, optional
-        Distortion/weighting function w(u) with w(0)=0, w(1)=1 and nondecreasing.
-        If None, uses identity w(u)=u (standard expectation).
-        Examples:
-            - identity: lambda u: u
-            - Prelec (risk-seeking/averse depending on α,β):
-                lambda u, α=0.7, β=1.0: np.exp(-β * (-np.log(np.clip(u,1e-12,1)))**α)
-            - Power: lambda u, γ=0.8: u**γ
-    axis : int
-        Axis containing the i.i.d. samples.
-    keepdims : bool
-        Whether to keep reduced dimensions.
-    validate : bool
-        If True, checks basic monotonicity and boundary conditions for w.
+        # Right column: single axis spanning all rows
+        self.render_ax = self.fig.add_subplot(gs[:-1, 1])
+        self.render_ax.set_xticks([])
+        self.render_ax.set_xticklabels([])
+        self.render_ax.set_yticks([])
+        self.render_ax.set_yticklabels([])
 
-    Returns
-    -------
-    ew : ndarray
-        Quantile-based expectation along `axis`. Shape is `samples` with
-        the sample axis removed unless `keepdims=True`.
-    """
+        self.status_ax = self.fig.add_subplot(gs[-1, 1])
 
-    device, dtype = None,None
-    is_torch = isinstance(samples,torch.Tensor)
-    if is_torch:
-        device, dtype = samples.device, samples.dtype
-        samples = samples.cpu().numpy()
+        # Adjust layout
+        # plt.tight_layout()
+        plt.show()
 
-    x = np.asarray(samples)
-    # Move sample axis to the last for convenience
-    x = np.moveaxis(x, axis, -1)
+    def _plot_history(self,
+                      traj_history,
+                      terminal_history,
+                      filt_reward_history,
+                      ep_len_history=None,
+                      env=None,
+                      lw=0.5,
+                      tpause=0.1,
+                      log_interval=1):
 
-    # Drop NaNs if present
-    mask = ~np.isnan(x)
+        env = env or self.env
 
-    # If any NaNs, we’ll mask per-slice; otherwise fast path
-    if mask.all():
-        sorted_x = np.sort(x, axis=-1)
-        n = sorted_x.shape[-1]
-        if n == 0:
-            raise ValueError("No samples provided along the chosen axis.")
-        if weight_fn is None:
-            # E[X] = mean via quantile integral equals arithmetic mean
-            ew = sorted_x.mean(axis=-1, keepdims=keepdims)
-            return np.moveaxis(ew, -1, axis) if keepdims else ew
-        # Build grid u_i = i/n, i=0..n
-        u = np.linspace(0.0, 1.0, n + 1)
-        w = np.fromiter((weight_fn(ui) for ui in u), dtype=float, count=n + 1)
-        if validate:
-            if not (np.isclose(w[0], 0.0) and np.isclose(w[-1], 1.0)):
-                raise ValueError("weight_fn must satisfy w(0)=0 and w(1)=1.")
-            if np.any(np.diff(w) < -1e-12):
-                raise ValueError("weight_fn must be nondecreasing on [0,1].")
-        dw = np.diff(w)  # length n, nonnegative
-        # Weighted sum of order stats by increments of w
-        ew = np.sum(sorted_x * dw[..., None].swapaxes(0, -1)[0], axis=-1)
-        # Above swap is awkward; simpler:
-        # ew = np.tensordot(sorted_x, dw, axes=([-1],[0]))
-        ew = np.tensordot(sorted_x, dw, axes=([-1], [0]))
-        if keepdims:
-            ew = np.expand_dims(ew, axis=-1)
-        # return ew
+        if self.fig is None:
+            self._spawn_figure()
 
+        x = np.arange(len(filt_reward_history)) * log_interval
+        mean, std = filt_reward_history[:, 0], filt_reward_history[:, 1]
 
-    else:
-        # Handle NaNs per slice by compacting
-        # Flatten leading dims, iterate last dim stacks
-        lead_shape = x.shape[:-1]
-        ew = np.empty(lead_shape, dtype=float)
-        it = np.nditer(np.zeros(lead_shape), flags=['multi_index'])
+        # Reward plot
+        if 'reward_line' not in self.fig_assets.keys():
+            self.fig_assets['reward_line'] = self.rew_ax.plot(x, mean, lw=lw, color='k')[0]
+            self.rew_ax.set_ylabel('Total Reward')
 
-        if weight_fn is None:
-            while not it.finished:
-                vals = x[it.multi_index]
-                vals = vals[~np.isnan(vals)]
-                if vals.size == 0:
-                    ew[it.multi_index] = np.nan
-                else:
-                    ew[it.multi_index] = vals.mean()
-                it.iternext()
+            # plot 1 std deviation as shaded region
+            self.fig_assets['reward_patch'] = self.rew_ax.fill_between(x, mean - std, mean + std,
+                                                                       color='b', alpha=0.2)
+
+            if ep_len_history is not None:
+                self.rew_ax2 = self.rew_ax.twinx()
+                self.fig_assets['ep_len_line'], = self.rew_ax2.plot(x, ep_len_history, color='g',
+                                                                    label='Episode Length', lw=lw)
+                self.rew_ax2.set_ylabel('Episode Length', color='g')
+                self.rew_ax2.tick_params(axis='y', labelcolor='g')
+
 
 
         else:
-            # Precompute nothing; evaluate w on each slice's n
-            while not it.finished:
-                vals = x[it.multi_index]
-                vals = vals[~np.isnan(vals)]
-                if vals.size == 0:
-                    ew[it.multi_index] = np.nan
+            self.fig_assets['reward_line'].set_data(x, mean)
+            self.fig_assets['reward_patch'].remove()
+            self.fig_assets['reward_patch'] = self.rew_ax.fill_between(
+                x,
+                mean - std,
+                mean + std,
+                color='b',
+                alpha=0.2
+
+            )
+            self.rew_ax.relim()
+            self.rew_ax.autoscale_view()
+
+            if ep_len_history is not None:
+                self.fig_assets['ep_len_line'].set_data(x, ep_len_history)
+                self.rew_ax2.relim()
+                self.rew_ax2.autoscale_view()
+
+        # # Trajectories
+        if 'traj_lines' not in self.fig_assets.keys():
+
+            # render environment once for background
+            env.reset(**self.reset_params)
+            if hasattr(env, 'num_envs'):  env.call('render', ax=self.render_ax)  # retrieve vec render
+            else: env.render(ax=self.render_ax, draw_dist2goal=False, draw_lidar=False)  # single env render
+
+            # plot trajectories and save objects for later updating
+            self.fig_assets['traj_lines'] = []
+            self.fig_assets['traj_starts'] = []
+            for (traj, term) in zip(traj_history, terminal_history):
+                if term == 'goal_reached': plt_params = {'color': 'green', 'alpha': 0.7, 'lw': 2 * lw}
+                elif 'collision' in term: plt_params = {'color': 'red', 'alpha': 0.7, 'lw': lw}
+                elif term == 'max_steps': plt_params = {'color': 'gray', 'alpha': 0.7, 'lw': lw}
                 else:
-                    vals.sort()
-                    n = vals.size
-                    u = np.linspace(0.0, 1.0, n + 1)
-                    w = np.fromiter((weight_fn(ui) for ui in u), dtype=float, count=n + 1)
-                    if validate:
-                        if not (np.isclose(w[0], 0.0) and np.isclose(w[-1], 1.0)):
-                            raise ValueError("weight_fn must satisfy w(0)=0 and w(1)=1.")
-                        if np.any(np.diff(w) < -1e-12):
-                            raise ValueError("weight_fn must be nondecreasing on [0,1].")
-                    dw = np.diff(w)
-                    ew[it.multi_index] = np.dot(vals, dw)
-                it.iternext()
-        if keepdims:
-            ew = np.expand_dims(ew, axis=-1)
+                    raise ValueError(f"Unknown terminal cause: {term}")
+                self.fig_assets['traj_lines'].append(self.render_ax.plot(traj[:, 0], traj[:, 1], **plt_params)[0])
+                self.fig_assets['traj_starts'].append(self.render_ax.plot(traj[0, 0], traj[0, 1], marker='o', markersize=3, **plt_params)[0])
 
-    if is_torch:
-        ew = torch.tensor(ew, device=device, dtype=dtype)
+            self.render_ax.set_title('Trajectories (last {} eps)'.format(len(traj_history)))
 
-    return ew
-def quantile_expectation2(X):
-    """Computes expected mean of distribution from only samples using quantile integration.
-    - Assumes evenly spaced samples ol
+        else:
+            # update existing trajectory lines
+            for i, traj, term in zip(np.arange(len(traj_history)), traj_history, terminal_history):
+                if term == 'goal_reached': plt_params = {'color': 'green', 'alpha': 0.7, 'lw': 2 * lw}
+                elif 'collision' in term: plt_params = {'color': 'red', 'alpha': 0.7, 'lw': lw}
+                elif term == 'max_steps': plt_params = {'color': 'gray', 'alpha': 0.7, 'lw': lw}
+                else: raise ValueError(f"Unknown terminal cause: {term}")
 
-    """
-    # raise NotImplementedError("Use pdf_expectation instead; quantile_expectation is deprecated.")
-    assert X.ndim == 1, "X must be 1D array of value samples"
+                self.fig_assets['traj_lines'][i].set_data(traj[:, 0], traj[:, 1])
+                self.fig_assets['traj_lines'][i].set_color(plt_params['color'])
+                self.fig_assets['traj_lines'][i].set_alpha(plt_params['alpha'])
+
+                self.fig_assets['traj_starts'][i].set_data(traj[0, 0], traj[0, 1])
+                self.fig_assets['traj_starts'][i].set_color(plt_params['color'])
+                self.fig_assets['traj_starts'][i].set_alpha(plt_params['alpha'])
+
+        # plt.draw()
+        # plt.pause(tpause)
+
+    def _plot_losses(self, actor_loss_history, critic_loss_history, tpause=0.1, log_interval=1, lw=0.5):
+
+        if self.fig is None:
+            self._spawn_figure()
+
+        # Plot a dual axis loss plot
+        x = np.arange(len(actor_loss_history)) * log_interval
+        if 'actor_loss_line' not in self.fig_assets.keys():
+            self.fig_assets['actor_loss_line'], = self.loss_ax.plot(x, actor_loss_history, color='b',
+                                                                    label='Actor Loss', lw=lw)
+            # self.loss_ax.set_xlabel('Episode')
+            self.loss_ax.set_ylabel('Actor Loss', color='b')
+            self.loss_ax.tick_params(axis='y', labelcolor='b')
+
+            self.loss_ax2 = self.loss_ax.twinx()
+            self.fig_assets['critic_loss_line'], = self.loss_ax2.plot(x, critic_loss_history, color='r',
+                                                                      label='Critic Loss', lw=lw)
+            self.loss_ax2.set_ylabel('Critic Loss', color='r')
+            self.loss_ax2.tick_params(axis='y', labelcolor='r')
+
+            # self.loss_ax.set_title('Losses (eps)')
+        else:
+            self.fig_assets['actor_loss_line'].set_data(x, actor_loss_history)
+            self.fig_assets['critic_loss_line'].set_data(x, critic_loss_history)
+            self.loss_ax.relim()
+            self.loss_ax.autoscale_view()
+            self.loss_ax2.relim()
+            self.loss_ax2.autoscale_view()
+
+
+    def _plot_schedules(self, tpause=0.01, log_interval=1, lw=0.5, **kwargs):
+        max_val = 0
+        min_val = 0
+        for key, val in kwargs.items():
+            x = np.arange(len(val)) * log_interval
+            max_val = max(np.max(val), max_val)
+            min_val = min(np.min(val), min_val)
+            if key not in self.fig_assets.keys():
+                self.fig_assets[key], = self.sched_ax.plot(x, val, label=key, lw=lw)
+                self.sched_ax.legend(loc='upper right')
+                self.sched_ax.set_ylabel('Schedules')
+            else:
+                self.fig_assets[key].set_data(x, val)
+
+        self.sched_ax.relim()
+        self.sched_ax.autoscale_view()
+        self.sched_ax.set_ylim(min_val * 0.9, max_val * 1.1)
+
+
+    def _plot_spin(self):
+        """Call frequently to unfreeze plot """
+        if self.fig is not None:
+            self.fig.canvas.flush_events()
+
+    def _compute_status_fontsize(self, rows, cols):
+        """Pick a fontsize (in points) to fit current axis size and cell count."""
+        ax = self.status_ax
+        fig = ax.figure
+        # axis bbox in inches
+        bbox_in = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+        w_px = bbox_in.width * fig.dpi
+        h_px = bbox_in.height * fig.dpi
+        # conservative fit: leave room for padding and variable string lengths
+        cell_w = max(1.0, w_px / max(1, cols))
+        cell_h = max(1.0, h_px / max(1, rows))
+        # Heuristics: characters roughly square-ish in many UI fonts; prefer height
+        fs_from_h = cell_h * 0.45
+        fs_from_w = cell_w * 0.22  # allow ~4–5 chars per cell-width at this scale
+        fs = min(fs_from_h, fs_from_w)
+        return max(6, min(24, fs))  # clamp to a reasonable range
+
+    def _ensure_resize_hook(self):
+        """Connect a resize hook once; it just re-tunes fonts next draw."""
+        if getattr(self, "_status_resize_cid", None) is None and self.status_ax.figure.canvas is not None:
+            def _on_resize(event):
+                if getattr(self, "_status_table", None) is not None:
+                    rows, cols = self._status_shape
+                    fs = self._compute_status_fontsize(rows, cols)
+                    for (r, c), cell in self._status_cells.items():
+                        cell.get_text().set_fontsize(fs)
+                    self.status_ax.figure.canvas.draw_idle()
+
+            self._status_resize_cid = self.status_ax.figure.canvas.mpl_connect("resize_event", _on_resize)
+
+    def _plot_status(self, n_cols=1, add_key=False, cell_facecolor="#f5f5f7", edgecolor="#dddddd", **kwargs):
+        """
+        Draw/update a values-only table of kwargs on self.status_ax.
+
+        Parameters
+        ----------
+        n_cols : int
+            Number of table columns. Rows are computed automatically.
+        cell_facecolor : color
+            Background color for cells.
+        edgecolor : color
+            Edge color for grid lines.
+        **kwargs :
+            Key/value pairs to render. Only the *values* are shown in cells.
+
+        Behavior
+        --------
+        - Rebuilds the grid if shape/column count changes.
+        - Otherwise updates cell texts in-place for speed.
+        - Font size auto-adjusts to axis size on each call and on window resize.
+        """
+        if self.fig is None:
+            self._spawn_figure()
+
+        ax = self.status_ax
+        if add_key:
+            for k,val in kwargs.items():
+                # kwargs[k] = f"{k}: {val:.4f}" if isinstance(val, float) else f'{k}: {val}'
+                kwargs[k] = f'{k}: {val}'
+
+
+        items = list(kwargs.items())
+        n_items = len(items)
+        n_cols = max(1, int(n_cols))
+        n_rows = max(1, math.ceil(n_items / n_cols))
+
+        # Prepare axis
+        ax.set_axis_off()
+
+        # If no table exists yet, or geometry changed, rebuild
+        needs_rebuild = (
+                getattr(self, "_status_table", None) is None
+                or getattr(self, "_status_shape", None) != (n_rows, n_cols)
+        )
+
+        if needs_rebuild:
+            ax.clear()
+            ax.set_axis_off()
+
+            tbl = Table(ax, bbox=[0, 0, 1, 1])
+            ax.add_table(tbl)
+
+            # Even column widths, row heights
+            col_w = 1.0 / n_cols
+            row_h = 1.0 / n_rows
+
+            cells = {}
+            # Build all cells (values only)
+            for r in range(n_rows):
+                for c in range(n_cols):
+                    # Table cells are positioned by (row, col)
+                    cell = tbl.add_cell(row=r, col=c,
+                                        width=col_w, height=row_h,
+                                        text="",
+                                        loc="center",
+                                        facecolor=cell_facecolor,
+                                        edgecolor=edgecolor)
+                    # Slightly tighter text box so long values don't clip too early
+                    cell.PAD = 0.02
+                    cells[(r, c)] = cell
+
+            self._status_table = tbl
+            self._status_cells = cells
+            self._status_shape = (n_rows, n_cols)
+            self._status_keys = []  # will set below
+            self._ensure_resize_hook()
+
+        # Update texts and remember current key order -> cell mapping
+        fs = self._compute_status_fontsize(n_rows, n_cols)
+        keys_in_order = []
+        for idx, (k, v) in enumerate(items):
+            r = idx // n_cols
+            c = idx % n_cols
+            if (r, c) in self._status_cells:
+                cell = self._status_cells[(r, c)]
+                cell.get_text().set_text("" if v is None else str(v))
+                cell.get_text().set_fontsize(fs)
+                cell.get_text().set_color("black")
+            keys_in_order.append(k)
+
+        # Clear any extra cells (e.g., last row partially filled)
+        for idx in range(n_items, n_rows * n_cols):
+            r = idx // n_cols
+            c = idx % n_cols
+            if (r, c) in self._status_cells:
+                self._status_cells[(r, c)].get_text().set_text("")
+
+        self._status_keys = keys_in_order
+
+        # Redraw efficiently
+        if self.status_ax.figure.canvas is not None:
+            self.status_ax.figure.canvas.draw_idle()
+
+    def spin(self):
+        self._plot_spin()
+
+    def draw(self, tpause=0.1):
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+        # plt.draw()
+        # plt.pause(tpause)
+
+    # def checkpoint(self, ep):
+    #     """Draw horizontal line on axes at episode `ep` to mark a checkpoint and update this line when called again
     #
-    X_sorted = np.sort(X, axis=-1)
-    n = X.shape[0]
-    Xi = X[:-1]
-    dX = X[1:] - Xi
-    exp = (1/n) * np.sum(X_sorted[:-1] + X_sorted[1:]) / 2.0
-    return exp
+    #     Draw axes:
+    #         self.rew_ax
+    #         self.loss_ax
+    #         self.sched_ax
+    #      """
+    def checkpoint(self, ep):
+        """
+        Mark a training checkpoint at episode `ep` by drawing a vertical line (x = ep)
+        on the reward/loss/schedule axes. If called again, the existing checkpoint
+        lines are moved to the new episode.
 
-# def quantile_expectation_torch_batch(X):
-#     assert X.ndim == 2, "X must be 1D array of value samples"
-#
-#     # Sort each batch individually along dim=1
-#     X_sort, sort_idx = torch.sort(X, dim=1)
-#
-#     X_sorted = np.sort(X, axis=-1)
-#
-#     exp = (1 / n) * np.sum(X_sorted[:-1] + X_sorted[1:]) / 2.0
+        Notes
+        -----
+        - Although the docstring says "horizontal", episode is on the x-axis in this logger,
+          so the checkpoint marker is a *vertical* line at x = ep.
+        """
+        if self.fig is None:
+            self._spawn_figure()
 
+        try:
+            ep = float(ep)
+        except (TypeError, ValueError):
+            raise ValueError(f"`ep` must be numeric; got {ep!r}")
 
+        # Style for the checkpoint marker
+        line_kwargs = dict(color="purple", linestyle="--", linewidth=1.0, alpha=0.8, zorder=10)
 
-def pdf_expectation(X,pdf, normalize=True):
-    """Computes expected mean of distribution from samples and pdf weights using trapezoidal integration."""
-    isort =  np.argsort(X)
-    X_sort = X[isort]
-    pdf_sort = pdf[isort]
-    dx = X_sort[1:] - X_sort[:-1]
+        def _set_or_update_vline(ax, key):
+            # Create or update the line object
+            if key not in self.fig_assets:
+                self.fig_assets[key] = ax.axvline(ep, **line_kwargs)
+            else:
+                ln = self.fig_assets[key]
+                # axvline returns a Line2D; update its x-position
+                ln.set_xdata([ep, ep])
 
-    # Normalize pdf so that ∫ pdf dx = 1 over the uneven grid
-    if normalize:
-        pdf_sort /= np.trapz(pdf_sort, X_sort)
+            # Ensure the marker is visible even if ep extends beyond current limits
+            xmin, xmax = ax.get_xlim()
+            if ep < xmin or ep > xmax:
+                pad = 0.02 * max(1.0, abs(xmax - xmin))
+                ax.set_xlim(min(xmin, ep) - pad, max(xmax, ep) + pad)
 
-    # Compute expected value E[X] = ∫ x * pdf(x) dx
-    exp = np.sum(0.5 * (X_sort[1:] + X_sort[:-1]) * pdf_sort[:-1] * dx)
-    return exp
+        _set_or_update_vline(self.rew_ax, "ckpt_vline_rew")
+        _set_or_update_vline(self.loss_ax, "ckpt_vline_loss")
+        _set_or_update_vline(self.sched_ax, "ckpt_vline_sched")
 
-def pdf_expectation_torch_batch(X, pdf, normalize=True):
-    """
-    Batched expected value of a PDF over unevenly spaced X.
-
-    Args:
-        X   : (B, N) tensor of sample locations
-        pdf : (B, N) tensor of pdf values
-        normalize (bool): normalize pdf so ∫pdf dx = 1 for each batch
-
-    Returns:
-        exp_vals : (B,) tensor of expected values
-    """
-    if X.ndim != 2 or pdf.ndim != 2:
-        raise ValueError("X and pdf must both be 2D tensors (B, N).")
-    if X.shape != pdf.shape:
-        raise ValueError("X and pdf must have the same shape.")
-
-    B, N = X.shape
-    device, dtype = X.device, X.dtype
-
-    X = X.to(device=device, dtype=torch.float64)        # change to double percision
-    pdf = pdf.to(device=device, dtype=torch.float64)    # change to double percision
-
-
-    # Sort each batch individually along dim=1
-    X_sort, sort_idx = torch.sort(X, dim=1)
-    pdf_sort = torch.gather(pdf, 1, sort_idx)
-
-    # compute area intervals and normalize pdfs
-    dx = X_sort[:, 1:] - X_sort[:, :-1]
-    if normalize:
-        # Trapezoidal integral for normalization (batchwise)
-        area = torch.sum(0.5 * (pdf_sort[:, 1:] + pdf_sort[:, :-1]) * dx, dim=1, keepdim=True)
-        pdf_sort = pdf_sort / area
-
-    # Midpoint-style expectation across uneven grid
-    exp_vals = torch.sum(
-        0.5 * (X_sort[:, 1:] + X_sort[:, :-1]) * pdf_sort[:, :-1] * dx,
-        dim=1
-    )
-
-    # handle edge case where all samples are same reward (numerical instability)
-    uniform_dx_idxs = torch.where(torch.all(dx==0,dim=1))
-    for i in uniform_dx_idxs:
-        exp_vals[i] = X_sort[i,0]
-    # exp_vals[torch.all(dx==0,dim=1)] = X_sort[torch.all(dx==0,dim=1)] # handle edge case where all same reward
-
-    assert torch.all(torch.isfinite(exp_vals)), "Non-finite expected values computed."
-
-    return exp_vals.to(dtype=dtype)
-
-
-def test_risk_sensitivity():
-    np.random.seed(0)
-    # set scipy seed
-    n_samples = 50
-
-    # for mu,std in zip([-2.0, 0.0, 5.0, 0.5],[1.0,0.5,0.75,0.1]):
-    # for mu, std in zip([5.0, 1,0.0,  0.5,0.75, -2.0], [1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6]):
-    # for mu, std in zip([5.0, 1,  0.5,0.0, 0.5, -1.0, -5], [1e-6,1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6]):
-    for mu, std in zip([5.0, 1, 0.5, 0.0, 0.5, -1.0, -5],
-                       [1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6]):
-        X = np.random.normal(mu, std, size=n_samples)
-        pdf = norm.pdf(X, loc=mu, scale=std)
-        # pdf = np.clip(pdf,0,1)
-
-
-        # print(f"Analytical E[X]: {exp_analytical}")
-        print(f'\n\n mu = {mu} std ={std} ########################################')
-        quant_exp_err = mu - quantile_expectation(X) #mu - quantile_expectation(X)
-        pdf_exp_err = mu - pdf_expectation(X, pdf, normalize=True)
-
-        X = torch.tensor(X.reshape(1,-1), dtype=torch.float64)
-        pdf = torch.tensor(pdf.reshape(1,-1), dtype=torch.float64)
-        pdf_pt_exp_err = (mu - pdf_expectation_torch_batch(X, pdf, normalize=True)).numpy()[0]
-
-        print(f"Quantile Int Error E[X]: {quant_exp_err}")
-        print(f"PDF-weighted Error E[X]: {pdf_exp_err}")
-        print(f"PT-PDF-weighted Error E[X]: {pdf_pt_exp_err}")
-        best = 'PDF' if abs(pdf_exp_err) < abs(quant_exp_err) else 'Quantile'
-        print(f"Best Method: {best}")
-        # print(f"PDF-weighted Error E[X]: {mu - pdf_expectation(X, pdf, normalize=False )}")
-        # print(f"PDF-weighted Error E[X]: {mu - pdf_expectation2(X, pdf)}")
+        # Efficient redraw
+        if self.fig is not None and self.fig.canvas is not None:
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
 
 
 ####################################################################
 ### LEARNING TOOLS #################################################
 ####################################################################
-class OUNoiseBounded:
-    """
-    Ornstein–Uhlenbeck process with bounded state.
-
-    x_{t+dt} = x_t + theta*(mu - x_t)*dt + sigma*sqrt(dt)*N(0, I)
-
-    Parameters
-    ----------
-    shape : tuple or int
-        Shape of the noise state (e.g., action dimension).
-    mu : float or array-like, default 0.0
-        Long-run mean (broadcastable to `shape`).
-    theta : float, default 0.15
-        Mean-reversion rate.
-    sigma : float or array-like, default 0.2
-        Diffusion scale (broadcastable to `shape`).
-    dt : float, default 1e-2
-        Time step.
-    x0 : None or array-like
-        Initial state (bounded). If None, starts at `mu` squashed/trimmed into bounds.
-    low : float or array-like, default -1.0
-        Lower bound(s).
-    high : float or array-like, default 1.0
-        Upper bound(s).
-    mode : {"clip", "reflect", "squash"}, default "reflect"
-        Bounding mode:
-          - "clip": clip state into [low, high]
-          - "reflect": reflect back into [low, high] if overshoot occurs
-          - "squash": evolve latent z (unbounded OU), then x = low + (high-low)*(tanh(z)+1)/2
-    seed : int or None
-        Random seed.
-
-    Notes
-    -----
-    - For "squash" mode, the visible state `x` is always in [low, high] but internally the OU runs on `z`.
-    - For "reflect" mode, large overshoots are handled without bias using modulo reflection.
-
-    Methods
-    -------
-    reset(x0=None): Reset the process state.
-    sample(): Step once and return the new bounded state.
-    __call__(): Alias of `sample()`.
-    state: Property to inspect current bounded state.
-    """
-
-    def __init__(self, shape,
-                 mu=0.0, theta=0.15, sigma=0.2, dt=1e-2,
-                 sigma_min=0.05, sigma_decay=.995,
-                 x0=np.array([0,0]),
-                 low=(-1.0,0.0), high=(1.0, 1.0),
-                 mode="reflect",
-                 device = 'cpu',
-                 decay_freq= None,
-                 seed=None):
-        self.shape = (shape,) if isinstance(shape, int) else tuple(shape)
-        self.theta = float(theta)
-        self.dt = float(dt)
-        self.mu = np.broadcast_to(np.asarray(mu, dtype=float), self.shape)
-        self.sigma = np.broadcast_to(np.asarray(sigma, dtype=float), self.shape)
-        self.sigma_min = sigma_min
-        self.sigma_decay = sigma_decay
-        self.device = device
-        self.low = np.broadcast_to(np.asarray(low, dtype=float), self.shape)
-        self.high = np.broadcast_to(np.asarray(high, dtype=float), self.shape)
-
-        self._sigma0 = self.sigma.copy()
-        self.decay_freq = decay_freq # if none, decay on reset
-        self.decay_count = 1
-
-        if np.any(self.high <= self.low):
-            raise ValueError("All elements of `high` must be greater than `low`.")
-
-        self.mode = str(mode).lower()
-        if self.mode not in {"clip", "reflect", "squash"}:
-            raise ValueError("mode must be 'clip', 'reflect', or 'squash'.")
-
-        # self.rng = np.random.default_rng(seed)
-
-        # State variables
-        self._x = None           # visible (bounded) state
-        self._z = None           # latent (for squash mode)
-        self._x0 = x0
-        self.reset()
-
-    # ---------- Public API ----------
-    def reset_sigma(self):
-        self.sigma = self._sigma0.copy()
-        self.decay_count = 1
-
-    def reset(self):
-        x0 = self._x0
-        """Reset the process. If x0 is None, start from mu (bounded)."""
-        if self.mode == "squash":
-            # initialize latent z so that tanh(z) maps near mu within bounds
-            # invert the squash around midpoint:
-            mid = (self.low + self.high) / 2.0
-            half = (self.high - self.low) / 2.0
-            target = np.clip((self.mu - mid) / np.maximum(half, 1e-12), -0.999999, 0.999999)
-            self._z = np.arctanh(target)
-            self._x = self._squash(self._z) if x0 is None else self._clip_into_bounds(np.asarray(x0, float))
-        else:
-            start = self.mu if x0 is None else np.asarray(x0, dtype=float)
-            self._x = self._clip_into_bounds(start)
-            self._z = None
-
-        # Decay sigma exploration (on reset)
-        if self.decay_freq is None:
-            dsig = - self.sigma * (1 - self.sigma_decay)
-            sigma = self.sigma + (dsig)
-            self.sigma = np.max([self.sigma_min*np.ones_like(sigma), sigma],axis=0)
-
-        return self._x.copy()
-
-    def sample(self):
-        """Advance one step and return the new bounded state."""
-        # n = self.rng.standard_normal(self.shape)
-        n = np.random.standard_normal(self.shape)
-        if self.mode == "squash":
-            # OU on latent z, then squash to bounded x
-            x = self._z.copy()
-            self._z = x + self.theta * (self.mu - x) + self.sigma * n
-            # self._z = self._z + self.theta * (0.0 - self._z) * self.dt + self.sigma * np.sqrt(self.dt) * n
-            self._x = self._squash(self._z)
-        else:
-            # OU directly on bounded x, then bound via clip or reflect
-            # x = self._x + self.theta * (self.mu - self._x) * self.dt + self.sigma * np.sqrt(self.dt) * n
-            x = self._x.copy()
-            x = x + self.theta * (self.mu - x) + self.sigma * n
-
-
-            if self.mode == "clip":
-                self._x = self._clip_into_bounds(x)
-            elif self.mode == "reflect":
-                self._x = self._reflect_into_bounds(x)
-
-        # Decay sigma exploration (on sample)
-        if self.decay_freq is not None and (self.decay_count % self.decay_freq == 0):
-            dsig = - self.sigma * (1 - self.sigma_decay)
-            sigma = self.sigma + (dsig)
-            self.sigma = np.max([self.sigma_min*np.ones_like(sigma), sigma],axis=0)
-            self.decay_count = 1
-        else:
-            self.decay_count += 1
-
-
-        # return torch.tensor(self._x.copy(), dtype=torch.float32, device=self.device)
-        return torch.tensor(self._x.copy(), dtype=torch.float32, device=self.device)
-
-    def __call__(self):
-        return self.sample()
-
-    @property
-    def state(self):
-        """Current bounded state (copy)."""
-        return None if self._x is None else self._x.copy()
-
-    # ---------- Utilities ----------
-
-    def _clip_into_bounds(self, x):
-        return np.clip(x, self.low, self.high)
-
-    def _reflect_into_bounds(self, x):
-        """
-        Vectorized reflection into [low, high] handling large overshoots:
-        Maps x using sawtooth reflection with period 2*width.
-        """
-        width = self.high - self.low
-        # Avoid /0 if any widths are zero (already checked above, but guard anyway)
-        width = np.maximum(width, 1e-12)
-        y = (x - self.low) % (2.0 * width)
-        y_ref = np.where(y <= width, self.low + y, self.high - (y - width))
-        return y_ref
-
-    def _squash(self, z):
-        """Map latent z in R smoothly to [low, high] via tanh."""
-        half = (self.high - self.low) / 2.0
-        mid = (self.high + self.low) / 2.0
-        return mid + half * np.tanh(z)
-
-    def __repr__(self):
-        return self.__str__()
-    def __str__(self):
-
-        s = f"OUNoiseBounded(shape={self.shape}, mode='{self.mode}')\n" \
-                f"\t| mu={self.mu}\n " \
-                f"\t| theta={self.theta}\n" \
-                f"\t| sigma={self.sigma}\n, " \
-                f"\t| sigma_decay={self.sigma_decay}\n" \
-                f"\t| decay_freq:{self.decay_freq }\n" \
-                f"\t| sigma_min={self.sigma_min}\n" \
-                f"\t| low={self.low}, high={self.high}\n"
-        return s
-
-class OUNoise:
-    """
-    Ornstein–Uhlenbeck noise for exploration.
-    Handles both single env and vectorized envs by broadcasting on shape.
-    - theta: rate of mean reversion (returns noise to mu)
-    - sigma: scale of noise
-    """
-    def __init__(self, shape, mu=0.0, theta=0.15, sigma=0.5, n_envs=1,
-                 sigma_min = 0.05, device='cpu', sigma_decay=.995,
-                 decay_freq= None,
-                 sigma_sched = None,
-                 **kwargs):
-
-
-        self.action_dim = shape
-        self.shape = shape
-        self.mu = mu
-        self.theta = theta
-
-        self._sigma0 = sigma
-        self.sigma = sigma
-        self.sigma_min = sigma_min
-        self.sigma_decay = sigma_decay
-        self.decay_freq = decay_freq # if none, decay on reset
-        self.decay_count = 1
-
-        self.sigma_sched = sigma_sched
-        if self.sigma_sched is not None:
-            self.sigma_sched['xstart'] = self.sigma
-            self.sigma_sched['xend'] = self.sigma_min
-            self.sigma_sched = Schedule(**self.sigma_sched)
-            # self.sigma_sched = Schedule(xstart=sigma,
-            #                             xend=sigma_min,
-            #                             horizon=1_000,
-            #                             step_event='sample',
-            #                             mode='exponential',
-            #                             exp_gain=2.0
-            #                             )
-
-
-        # self.dt = dt
-        self.n_envs = n_envs
-        self.device = device
-        self.size = (self.n_envs, self.action_dim)
-        self.reset()
-
-    def reset(self,i=None):
-        if i is None:
-            self.state = self.mu * torch.zeros(self.n_envs, self.action_dim, device=self.device)
-        else:
-            self.state[i] = 0
-
-        # Decay sigma exploration (on reset)
-        if self.decay_freq is None:
-            self.decay_sigma()
-
-    def sample(self, increment_decay=True):
-        x = self.state
-        # dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0,1,self.size,device=self.device)
-        dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0, 1, self.size, device=self.device)
-        self.state = x + dx
-
-        # Decay sigma exploration (on sample)
-        if self.decay_freq is not None and increment_decay:
-            if self.decay_count % self.decay_freq == 0:
-                self.decay_sigma()
-                self.decay_count = 1
-            else:
-                self.decay_count += 1
-
-        return self.state
-
-    def simulate(self,T=600):
-        n_trials = 3
-        self.reset()
-        # self.theta = 1
-        # self.sigma = 0.05
-        fig,axs = plt.subplots(self.action_dim,n_trials)
-
-        for trial in range(n_trials):
-            data = np.zeros((T, self.action_dim))
-            # xy = np.array([[0.0,0.0]])
-
-            for t in range(T):
-                xy = np.array([[0.0, 0.0]])
-                xy += self.sample().cpu().numpy()
-                data[t,:] = xy
-            # plot data
-            for d in range(self.action_dim):
-                axs[d,trial].plot(data[:,d])
-                axs[d,trial].set_title(f'OU Noise Dimension {["x","y"][d]}')
-                axs[d,trial].hlines(0, xmin=0, xmax=T, colors='k', linestyles='dashed', alpha=0.5)
-                axs[d,trial].set_xlabel('Timestep')
-
-
-        plt.show()
-
-    def reset_sigma(self):
-        self.sigma = self._sigma0
-        self.decay_count = 1
-
-    def decay_sigma(self):
-        if self.sigma_sched is not None:
-            self.sigma = self.sigma_sched.sample(advance=True)
-            return
-        dsig = - self.sigma * (1 - self.sigma_decay)
-        sigma = self.sigma + (dsig)
-        self.sigma = np.max([self.sigma_min * np.ones_like(sigma), sigma], axis=0)
-
-    def __repr__(self):
-        return self.__str__()
-    def __str__(self):
-
-        s = f"\nOUNoise(shape={self.shape})\n" \
-                f"\t| mu={self.mu}\n " \
-                f"\t| theta={self.theta}\n" \
-                f"\t| sigma={self.sigma}\n, " \
-                f"\t| sigma_decay={self.sigma_decay}\n" \
-                f"\t| decay_freq:{self.decay_freq }\n" \
-                f"\t| sigma_min={self.sigma_min}\n"
-        return s
-
 class ReplayBuffer:
     def __init__(self, obs_dim, act_dim, size=int(1e6), device='cpu'):
         self.device = device
@@ -662,8 +456,6 @@ class ProspectReplayBuffer(ReplayBuffer):
         # ensure batched
         s = torch.as_tensor(s, dtype=torch.float32, device=self.device)
         a = torch.as_tensor(a, dtype=torch.float32, device=self.device)
-
-        # r_prospects = self._handle_certain_r_prospects(r_prospects) # handles edge case with multiple certain samples
         r_prospects = torch.as_tensor(r_prospects, dtype=torch.float32, device=self.device)
         s2 = torch.as_tensor(s2, dtype=torch.float32, device=self.device)
         d_prospects = torch.as_tensor(d_prospects, dtype=torch.float32, device=self.device).view(-1, 1)
@@ -679,12 +471,6 @@ class ProspectReplayBuffer(ReplayBuffer):
         self.ptr = (self.ptr + n) % self.size
         if self.ptr == 0:
             self.full = True
-
-    def _handle_certain_r_prospects(self, r_prospects):
-        probs = r_prospects[1,:]
-        if np.all(probs == 1):
-            r_prospects[1, :] /= np.sum(probs)
-        return r_prospects
 
 class Schedule:
     """
@@ -711,6 +497,7 @@ class Schedule:
         assert mode in ['exponential', 'linear', 'decay','manual']
         if mode == 'decay':
             assert decay_rate is not None, "decay_rate must be specified for 'decay' mode"
+
         assert horizon >= 0, "horizon must be >= 0"
         self.is_trivial = horizon == 0
 
@@ -804,20 +591,16 @@ class Schedule:
         return self.state
 
     # ---------- API ----------
-    def reset(self):
+    def reset(self,at=None):
         """Resets the schedule to initial state; optionally advances on reset-event."""
         self._schedule_step = 0
         self._apply_state_from_step()
-        if self._step_event == 'reset':
+        if at is not None:
+            self.state = self.at(at)
+        elif self._step_event == 'reset':
             # Advance one step so next episode uses the next scheduled value
             self.advance(1)
         return self.state
-
-    # def step(self):
-    #     """Advance schedule if step_event == 'step'."""
-    #     if self._step_event == 'step':
-    #         self.advance(1)
-    #     return self.state
 
     def sample(self,at = None, advance = True):
         """Return current value; advance if step_event == 'sample'."""
@@ -870,6 +653,8 @@ class Schedule:
             ax.set_title(f"Schedule ({self._mode}, step_event={self._step_event})")
         ax.set_xlabel("Step")
         ax.set_ylabel("Value")
+
+
         # ax.tight_layout()
         if show:
             plt.show()
@@ -901,28 +686,120 @@ class Schedule:
             s += f"- exp_gain={self._exp_gain}"
         return s
 
+class OUNoise: # (Schedule): # Soft Inherit Schedule
+    """
+    Ornstein–Uhlenbeck noise for exploration.
+    Handles both single env and vectorized envs by broadcasting on shape.
+    - theta: rate of mean reversion (returns noise to mu)
+    - sigma: scale of noise
+    """
+    def __init__(self, shape, mode = 'exponential',
+                 mu=0.0, theta=0.15, sigma=0.5,  sigma_min = 0.05,
+                 n_envs=1, device='cpu',
+                 **kwargs):
 
+        self.sched = Schedule(xstart= sigma,
+                         xend = sigma_min,
+                         step_event=kwargs.pop('step_event',None),
+                         mode= mode,
+                         exp_gain=kwargs.pop('exp_gain', 2),
+                         horizon=kwargs.pop('horizon',3000),
+                         decay_rate= kwargs.pop('sigma_decay', None),
+                         name='OUNoise')
+
+        assert len(kwargs.keys()) == 0, f"Unknown kwargs passed to OUNoise: {kwargs.keys()}"
+
+        self.action_dim = shape
+        self.shape = shape
+        self.mu = mu
+        self.theta = theta
+
+        self._sigma0 = float(sigma)
+        self._sigma = float(sigma)
+        # self.sigma = float(sigma)
+        self.sigma_min = sigma_min
+
+        self.n_envs = n_envs
+        self.device = device
+        self.size = (self.n_envs, self.action_dim)
+        self.reset()
+
+    def reset(self,i=None,at=None, reset_sigma= False):
+        if i is None:
+            self.state = self.mu * torch.zeros(self.n_envs, self.action_dim, device=self.device)
+        else:
+            self.state[i] = 0
+        if reset_sigma:
+            self.sigma = self._sigma0
+            self.sched.reset()
+        if at is not None:
+            self.sigma = self.sched.at(at)
+
+    def sample(self, at = None, advance = True):
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0, 1, self.size, device=self.device)
+        self.state = x + dx
+
+        # Decay sigma exploration (on sample)
+        self.sigma = self.sched.sample(at=at, advance=advance) #* torch.ones_like(self.sigma)
+
+
+        return self.state
+
+    def plot(self,*args,**kwargs):
+        self.sched.plot(*args, **kwargs)
+
+    @property
+    def sigma(self):
+        return self._sigma
+    @sigma.setter
+    def sigma(self, value):
+        self._sigma = float(value)
+
+    def __repr__(self):
+        return self.__str__()
+    def __str__(self):
+
+        s = f"\nOUNoise(shape={self.shape})\n" \
+                f"\t| mu={self.mu}\n " \
+                f"\t| theta={self.theta}\n" \
+                f"\t| sigma={self.sigma}\n, " \
+                f"\t| sigma_min={self.sigma_min}\n"
+        s += '\t|' + self.sched.__str__().replace('\t','\t\t')
+        return s
+
+def soft_update(target, source, tau):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+def hard_update(target, source):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(param.data)
 
 
 
 def main():
-    test_risk_sensitivity()
-    # fig,axs = plt.subplots(1,2, figsize=(12,9))
-    # sched = Schedule(xstart=0.5, xend=0.05, horizon=1000, mode='exponential',exp_gain=2.0)
-    # sched.plot(axs[0], show =False, T=1000, label='exponential0', )
-    # print(sched)
+    # test_risk_sensitivity()
+    fig,axs = plt.subplots(1,2, figsize=(12,9))
+
+    sched = OUNoise(sigma=0.5, sigma_min=0.05, shape=2, horizon=0.9*3000, mode='exponential',  exp_gain=1,step_event=None)
+    sched.plot(axs[0], show=False, T=3500, label='OUNoise', )
     #
-    # # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='exponential',exp_gain=2.0)
-    # # sched.plot(axs[0], show=False, T=800, label='exponential1')
-    # #
-    # # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='linear')
-    # # sched.plot(axs[0], show =False, T=800)
-    # #
-    # # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, decay_rate=0.005, mode='decay')
-    # # sched.plot(axs[0], show =False, T=800)
-    # axs[0].legend()
-    # plt.show()
-    # pass
+    # sched = Schedule(xstart=1.0, xend=0.1, horizon=3000, mode='exponential',exp_gain=2.0)
+    # sched.plot(axs[0], show =False, T=3500, label='exponential0', )
+    # print(sched)
+
+    # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='exponential',exp_gain=2.0)
+    # sched.plot(axs[0], show=False, T=800, label='exponential1')
+    #
+    # sched = Schedule(xstart=1.0, xend=0.1, horizon=600, mode='linear')
+    # sched.plot(axs[0], show =False, T=800)
+    #
+    sched = OUNoise(sigma=0.5, sigma_min=0.05, shape=2, horizon=0.9*3000, mode='exponential',  exp_gain=2,step_event=None)
+    sched.plot(axs[0], show =False, T=3500,label='Ounoise (exp gain=2)')
+    axs[0].legend()
+    plt.show()
+    # # pass
 
 if __name__ == '__main__':
     main()
@@ -1085,3 +962,134 @@ if __name__ == '__main__':
 #                 f"\t| sigma_min={self.sigma_min}\n"\
 #                 f"\t| precompute={self.precompute}\n"
 #         return s
+
+
+# class OUNoise(Schedule):
+#     """
+#     Ornstein–Uhlenbeck noise for exploration.
+#     Handles both single env and vectorized envs by broadcasting on shape.
+#     - theta: rate of mean reversion (returns noise to mu)
+#     - sigma: scale of noise
+#     """
+#
+#     def __init__(self, shape, mu=0.0, theta=0.15, sigma=0.5, n_envs=1,
+#                  sigma_min=0.05, device='cpu', sigma_decay=.995,
+#                  decay_freq=None,
+#                  sigma_sched=None,
+#                  **kwargs):
+#
+#         super().__init__(xstart, xend,
+#                          **kwargs)
+#
+#         # xstart, xend, horizon,
+#         # step_event = 'sample', mode = 'exponential',
+#         # decay_rate = None, exp_gain = 1.0, name = ''
+#
+#         self.action_dim = shape
+#         self.shape = shape
+#         self.mu = mu
+#         self.theta = theta
+#
+#         self._sigma0 = sigma
+#         self.sigma = sigma
+#         self.sigma_min = sigma_min
+#         self.sigma_decay = sigma_decay
+#         self.decay_freq = decay_freq  # if none, decay on reset
+#         self.decay_count = 1
+#
+#         self.sigma_sched = sigma_sched
+#         if self.sigma_sched is not None:
+#             self.sigma_sched['xstart'] = self.sigma
+#             self.sigma_sched['xend'] = self.sigma_min
+#             self.sigma_sched = Schedule(**self.sigma_sched)
+#             # self.sigma_sched = Schedule(xstart=sigma,
+#             #                             xend=sigma_min,
+#             #                             horizon=1_000,
+#             #                             step_event='sample',
+#             #                             mode='exponential',
+#             #                             exp_gain=2.0
+#             #                             )
+#
+#         # self.dt = dt
+#         self.n_envs = n_envs
+#         self.device = device
+#         self.size = (self.n_envs, self.action_dim)
+#         self.reset()
+#
+#     def reset(self, i=None):
+#         if i is None:
+#             self.state = self.mu * torch.zeros(self.n_envs, self.action_dim, device=self.device)
+#         else:
+#             self.state[i] = 0
+#
+#         # Decay sigma exploration (on reset)
+#         if self.decay_freq is None:
+#             self.decay_sigma()
+#
+#     def sample(self, increment_decay=True):
+#         x = self.state
+#         # dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0,1,self.size,device=self.device)
+#         dx = self.theta * (self.mu - x) + self.sigma * torch.normal(0, 1, self.size, device=self.device)
+#         self.state = x + dx
+#
+#         # Decay sigma exploration (on sample)
+#         if self.decay_freq is not None and increment_decay:
+#             if self.decay_count % self.decay_freq == 0:
+#                 self.decay_sigma()
+#                 self.decay_count = 1
+#             else:
+#                 self.decay_count += 1
+#
+#         return self.state
+#
+#     def simulate(self, T=600):
+#         n_trials = 3
+#         self.reset()
+#         # self.theta = 1
+#         # self.sigma = 0.05
+#         fig, axs = plt.subplots(self.action_dim, n_trials)
+#
+#         for trial in range(n_trials):
+#             data = np.zeros((T, self.action_dim))
+#             # xy = np.array([[0.0,0.0]])
+#
+#             for t in range(T):
+#                 xy = np.array([[0.0, 0.0]])
+#                 xy += self.sample().cpu().numpy()
+#                 data[t, :] = xy
+#             # plot data
+#             for d in range(self.action_dim):
+#                 axs[d, trial].plot(data[:, d])
+#                 axs[d, trial].set_title(f'OU Noise Dimension {["x", "y"][d]}')
+#                 axs[d, trial].hlines(0, xmin=0, xmax=T, colors='k', linestyles='dashed', alpha=0.5)
+#                 axs[d, trial].set_xlabel('Timestep')
+#
+#         plt.show()
+#
+#     def reset_sigma(self):
+#         self.sigma = self._sigma0
+#         self.decay_count = 1
+#
+#     def decay_sigma(self):
+#         if self.sigma_sched is not None:
+#             self.sigma = self.sigma_sched.sample(advance=True)
+#             return
+#         dsig = - self.sigma * (1 - self.sigma_decay)
+#         sigma = self.sigma + (dsig)
+#         self.sigma = np.max([self.sigma_min * np.ones_like(sigma), sigma], axis=0)
+#
+#     def __repr__(self):
+#         return self.__str__()
+#
+#     def __str__(self):
+#
+#         s = f"\nOUNoise(shape={self.shape})\n" \
+#             f"\t| mu={self.mu}\n " \
+#             f"\t| theta={self.theta}\n" \
+#             f"\t| sigma={self.sigma}\n, " \
+#             f"\t| sigma_decay={self.sigma_decay}\n" \
+#             f"\t| decay_freq:{self.decay_freq}\n" \
+#             f"\t| sigma_min={self.sigma_min}\n"
+#         return s
+#
+
