@@ -46,7 +46,9 @@ REWARD_DIST2GOAL_EXP = 1.0
 REWARD_DIST2GOAL_PROG = True
 REWARD_DIST2GOAL = 0.1
 REWARD_STOPPING = 0.01
-REWARD_STEP =  -1.1*(REWARD_DIST2GOAL + REWARD_STOPPING)
+REWARD_STEP =  0 #-1.1*(REWARD_DIST2GOAL + REWARD_STOPPING)
+
+# REWARD_STEP =  -1.1*(REWARD_DIST2GOAL + REWARD_STOPPING)
 
 
 if not REWARD_DIST2GOAL_PROG:
@@ -587,6 +589,7 @@ class EnvBase(ABC):
         self.reward_dist2goal_exponent = REWARD_DIST2GOAL_EXP # exponent for distance to goal reward shaping
         self.reward_dist2goal = REWARD_DIST2GOAL  # maximum possible reward being close to goal
         self.reward_stopping = REWARD_STOPPING  # maximum possible reward being close to stopping to goal
+
 
         self.reward_max_step = self.reward_goal + self.reward_dist2goal + self.reward_stopping +self.reward_step
         self.reward_min_step = self.reward_collide + self.reward_step
@@ -1188,20 +1191,32 @@ class ContinousNavEnv(EnvBase):
         rewards = np.zeros(n)
 
         # Distance to goal shaped reward
-        dGoal = state_samples[:,self.state.idGoal]
-        rew_scale = np.power(1 - (dGoal / self.max_dist), self.reward_dist2goal_exponent)
-        rew_scale = np.clip(rew_scale, 0.0, 1.0)
-        # assert np.all(rew_scale <= 1.0) and np.all(rew_scale >= 0.0), f"rew_scale out of bounds: {rew_scale}"
-        rew_dist2goal = self.reward_dist2goal * rew_scale
-        info['rew_dist2goal'] = rew_dist2goal
-
-        if prev_state_samples is not None:
-            dGoal_prev = prev_state_samples[:,self.state.idGoal]
-            rew_scale = np.power(1 - (dGoal_prev / self.max_dist), self.reward_dist2goal_exponent)
-            rew_dist2goal_prev = self.reward_dist2goal * rew_scale
-            rew_dist2goal = np.power(rew_dist2goal - rew_dist2goal_prev,1)  # reward is the progress towards goal
-            # rew_dist2goal = np.clip(rew_dist2goal, self.reward_dist2goal, self.reward_dist2goal)
+        if prev_state_samples is None:
+            dGoal = state_samples[:,self.state.idGoal]
+            rew_scale = np.power(1 - (dGoal / self.max_dist), self.reward_dist2goal_exponent)
+            rew_scale = np.clip(rew_scale, 0.0, 1.0)
+            # assert np.all(rew_scale <= 1.0) and np.all(rew_scale >= 0.0), f"rew_scale out of bounds: {rew_scale}"
+            rew_dist2goal = self.reward_dist2goal * rew_scale
             info['rew_dist2goal'] = rew_dist2goal
+            assert np.all(np.abs(rew_dist2goal) <= self.reward_dist2goal + 1e-6), \
+                f"Invalid rew dist {rew_dist2goal[np.abs(rew_dist2goal) <= self.reward_dist2goal]}"
+
+
+        else:
+            dGoal = state_samples[:, self.state.idGoal]
+            dGoal_prev = prev_state_samples[:,self.state.idGoal]
+            dProg = dGoal_prev - dGoal  # positive if getting closer to goal
+            std_max_lin_vel = self.state.robot.belief_std[1] # assume max vel is within 2 std of mean
+            max_dProg = (self.state.robot.true_max_lin_vel + 2 * std_max_lin_vel) * self.dt
+            rew_scale = dProg / max_dProg
+            # assert np.all(np.abs(rew_scale) <= 1.0) , f"rew_scale out of bounds: {rew_scale}"
+
+            rew_dist2goal = self.reward_dist2goal * rew_scale
+            info['rew_dist2goal'] = rew_dist2goal
+
+            # assert np.all(np.abs(rew_dist2goal) <= self.reward_dist2goal + 1e-6), \
+            #     f"Invalid rew dist [<{self.reward_dist2goal}] " \
+            #     f"{rew_dist2goal[np.abs(rew_dist2goal) > self.reward_dist2goal]}"
 
         # Stopping in goal shaped reward
         if self.reward_stopping > 0:
@@ -1307,7 +1322,7 @@ def preview_action_samples(ax, env, action, block = True):
                draw_delayed=True,
                draw_robot=True,
                draw_robot_asimg=False,
-               draw_dist2goal=False,
+               draw_dist2goal=True,
                draw_lidar=False,
                ax=ax,
                pause=0.001)
@@ -1449,7 +1464,7 @@ def main_simulate():
                    draw_delayed=True,
                    draw_robot=True,
                    draw_robot_asimg=False,
-                   draw_dist2goal=False,
+                   draw_dist2goal=True,
                    draw_lidar=False,
                    ax=axs[1],
                    pause=0.001)
@@ -1473,5 +1488,5 @@ def main_simulate():
 
 
 if __name__ == "__main__":
-   # main_simulate()
-   main_preview()
+   main_simulate()
+   # main_preview()

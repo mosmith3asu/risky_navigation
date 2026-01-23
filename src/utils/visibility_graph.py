@@ -392,25 +392,69 @@ class Compiled_Dist2GoalFun:
 
         return best_r, best_c
 
-    def dist_xy(self, x, y):
-        """
-        Return the (dx, dy) = shortest-path step from the nearest valid grid point to (x,y),
-        plus the small correction from the grid point to the exact (x,y) (L1 in original code).
-        If no valid exists, behavior is defined by offsets pushing invalid far away.
-        """
+    def closest_bbox_idxs(self, x, y):
+        """Get the closest 4 bounding box indices around (x,y)"""
+        r0, c0 = self.closest_idx(x, y)
 
+        # shortest-path step vector field at grid point
+        dx0,dy0 = self.dist_grid[r0, c0, :]  # shape (2,)
+        if dx0 >= 0 and dy0>=0:
+            bbox = [(r0, c0), (r0+1, c0), (r0, c0+1), (r0+1, c0+1)]
+        elif dx0 < 0 and dy0>=0:
+            bbox = [(r0, c0), (r0-1, c0), (r0, c0+1), (r0-1, c0+1)]
+        elif dx0 >= 0 and dy0<0:
+            bbox = [(r0, c0), (r0+1, c0), (r0, c0-1), (r0+1, c0-1)]
+        elif dx0<0 and dy0<0:
+            bbox = [(r0, c0), (r0-1, c0), (r0, c0-1), (r0-1, c0-1)]
+        else:
+            raise ValueError("Unexpected case in closest_bbox_idxs")
+        return bbox
+    def interpolate_bbox(self, x, y, bbox):
+        """Bilinear interpolation of dist_grid at (x,y) using the 4 bbox indices."""
+        # Get the 4 bbox points and their grid coordinates
+        pts = np.empty((4, 2), dtype=np.float64)
+        vals = np.empty((4, 2), dtype=np.float64)
+        for i, rc in enumerate(bbox):
+            r,c = rc
+            pts[i,:] = self.grid[r, c]
+            vals[i,:] = self.dist_grid[r, c]
+        #     pts.append(self.grid[r, c])
+        #     vals.append(self.dist_grid[r, c])
+        # pts = np.array(pts)
+        # vals = np.array(vals)
+        # Bilinear interpolation weights
+        x0, y0 = pts[0]
+
+        x1, y1 = pts[3]
+        tx = (x - x0) / (x1 - x0) if x1 != x0 else 0.0
+        ty = (y - y0) / (y1 - y0) if y1 != y0 else 0.0
+        # Interpolate
+        dx = (1 - tx) * (1 - ty) * vals[0, 0] + tx * (1 - ty) * vals[1, 0] + (1 - tx) * ty * vals[2, 0] + tx * ty * vals[3, 0]
+        dy = (1 - tx) * (1 - ty) * vals[0, 1] + tx * (1 - ty) * vals[1, 1] + (1 - tx) * ty * vals[2, 1] + tx * ty * vals[3, 1]
+        return dx, dy
+
+    def dist_xy(self, x, y):
+        # """
+        # Return the (dx, dy) = shortest-path step from the nearest valid grid point to (x,y),
+        # plus the small correction from the grid point to the exact (x,y) (L1 in original code).
+        # If no valid exists, behavior is defined by offsets pushing invalid far away.
+        # """
+        #
         r, c = self.closest_idx(x, y)
 
         # shortest-path step vector field at grid point
         v = self.dist_grid[r, c, :]  # shape (2,)
 
         # correction from grid cell center to (x,y)
-        # out = np.empty(2, dtype=np.float64)
-        # out[0] = v[0] + np.abs(self.grid[r, c, 0] - x)
-        # out[1] = v[1] + np.abs(self.grid[r, c, 1] - y)
         dx = v[0] + np.abs(self.grid[r, c, 0] - x)
         dy = v[1] + np.abs(self.grid[r, c, 1] - y)
+
         return dx,dy
+        # bbox = self.closest_bbox_idxs(x, y)
+        # _dx, _dy = self.interpolate_bbox(x, y, bbox)
+        # assert np.shape(dx) == np.shape(_dx), f"Shape mismatch in dist_xy interpolation {(np.shape(dx),np.shape(_dx))}"
+        # assert np.shape(dy) == np.shape(_dy), f"Shape mismatch in dist_xy interpolation {(np.shape(dy),np.shape(_dy))}"
+        # return self.interpolate_bbox(x, y, bbox) # dx, dy
 
     def dist_dtheta(self, X):
         """
