@@ -14,6 +14,8 @@ This file is designed to be a drop-in sibling to `ac_agent.py` and to work with 
 
 from __future__ import annotations
 import copy
+import warnings
+
 import numpy as np
 import torch
 import torch.optim as optim
@@ -41,6 +43,7 @@ class SACAgent_BASE:
         policy_lr: float = 1e-4, # 3e-4,
         q_lr: float =  5e-4,
         alpha_init: float = 0.2,
+        alpha_range: Tuple[float, float] = (0.01, 1.0),
         alpha_lr: float = 3e-4, #  1e-4,
         automatic_entropy_tuning: bool = True,
         grad_clip: Optional[float] = None,
@@ -55,7 +58,9 @@ class SACAgent_BASE:
         updates_per_step: int = 1,
         num_hidden_layers: int = 5,
         size_hidden_layers: int = 256,
-        loads: Optional[str] = None
+            normailize_reward = False,
+        loads: Optional[str] = None,
+        note: str = '',
     ):
         self.env = env
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,7 +78,9 @@ class SACAgent_BASE:
         self.size_hidden_layers = size_hidden_layers
         self.grad_clip = grad_clip
         self._last_terminal_scale = 1 # accounts for cumulated rewards not terminating in sampled states
-
+        self.normailize_reward = normailize_reward
+        if self.normailize_reward:
+            warnings.warn("Reward normalization is enabled for SACAgent_BASE. Make sure this is intended.")
 
         # dims & bounds
         self.state_dim = env.observation_space.shape[0]
@@ -82,11 +89,6 @@ class SACAgent_BASE:
         self.a_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=self.device)
 
         # schedules / replay
-        # rand_start_sched_params = {"xstart": 1, "xend": 0.5, "horizon": random_start_epis, "mode": "linear"}
-        # self.rand_start_sched = Schedule(**rand_start_sched_params)
-        # rshape_sched_params = {"xstart": 1, "xend": 0.0, "horizon": rshape_epis, "mode": "linear"}
-        # self.rshape_sched = Schedule(**rshape_sched_params)
-
         rand_start_sched_params =  {"xstart": randstart_sched[0], "xend": randstart_sched[1], "horizon": randstart_sched[2], "mode": "linear"}
         rshape_sched_params = {"xstart": rshape_sched[0], "xend": rshape_sched[1], "horizon": rshape_sched[2], "mode": "linear"}
 
@@ -111,6 +113,9 @@ class SACAgent_BASE:
             n_hidden    = num_hidden_layers,
         ).to(self.device)
 
+        self.q_loss_fn = F.smooth_l1_loss
+        # self.q_loss_fn = F.mse_loss; warnings.warn("Using MSE loss for Q-function updates.")
+
         self.q1      = QNetwork(self.state_dim, self.action_dim, hidden_dim = size_hidden_layers, n_hidden = num_hidden_layers).to(self.device)
         self.q2      = QNetwork(self.state_dim, self.action_dim, hidden_dim = size_hidden_layers, n_hidden = num_hidden_layers).to(self.device)
         self.q1_targ = QNetwork(self.state_dim, self.action_dim, hidden_dim = size_hidden_layers, n_hidden = num_hidden_layers).to(self.device)
@@ -124,8 +129,11 @@ class SACAgent_BASE:
 
         # entropy temperature
         self.automatic_entropy_tuning = automatic_entropy_tuning
-        self.target_entropy = - target_entropy_scale * torch.log(1 / torch.tensor(self.action_dim, dtype=torch.float32,device=self.device))
+        # self.target_entropy = - target_entropy_scale * torch.log(1 / torch.tensor(self.action_dim, dtype=torch.float32,device=self.device))
+        self.target_entropy = -target_entropy_scale *(self.action_dim)
 
+
+        self.alpha_range = alpha_range
         if self.automatic_entropy_tuning:
             self.log_alpha = torch.tensor(np.log(alpha_init), dtype=torch.float32, device=self.device, requires_grad=True)
             self.alpha_opt = optim.Adam([self.log_alpha], lr=alpha_lr)
@@ -153,6 +161,10 @@ class SACAgent_BASE:
             "rand_start": [],
             "rshape": [],
         }
+
+        self.q_stats = {'max': deque(maxlen=self.env.max_steps),
+                        'min': deque(maxlen=self.env.max_steps)
+                        }
 
         self.emojis = {
             'goal_reached': '✅',
@@ -203,6 +215,9 @@ class SACAgent_BASE:
             o1 = self.env.observation
             a_np = np.random.uniform(low=self.env.action_space.low, high=self.env.action_space.high, size=self.action_dim)
             _, r_samples, done_samples, info = self.env.step(a_np)
+            if self.normailize_reward:
+                r_samples = self.env._normalize_reward(r_samples)
+
             o2 = self.env.observation
 
             o1_pt = torch.tensor(o1, dtype=torch.float32, device=self.device)
@@ -238,6 +253,9 @@ class SACAgent_BASE:
             tstart = datetime.now()
             # Update schedules
             self.logger.spin()
+            if self.logger.is_closed():
+                break
+
             self.env.rshape = self.rshape_sched.sample(at=ep)
             p_rand_state = self.rand_start_sched.sample(at=ep)
 
@@ -264,6 +282,9 @@ class SACAgent_BASE:
 
                 # Step
                 _, r_samples, done_samples, info = self.env.step(a1)
+                if self.normailize_reward:
+                    r_samples = self.env._normalize_reward(r_samples)
+
                 o2 = self.env.observation
                 o2_pt = torch.tensor(o2, dtype=torch.float32, device=self.device)
 
@@ -313,10 +334,12 @@ class SACAgent_BASE:
 
             if self.enable_print_report:
                 alpha_scalar = float(self.alpha.detach().cpu().item())
+                min_q = np.mean(self.q_stats['min']) if len(self.q_stats['min']) > 0 else 0.0
+                max_q = np.mean(self.q_stats['max']) if len(self.q_stats['max']) > 0 else 0.0
                 print(
                     f"[{np.mean(self.history['ep_dur']):.2f} sec/ep]"
                     f"[{self.__class__.__name__}] "
-                    f"Episode {ep} "
+                    f"ep {ep} "
                     f"| T: {i} it" #{i * self.env.dt:.1f}sec)"
                     f"| ∑r: {self.history['ep_reward'][-1]:.2f}"# ({running_rewards2:.2f})"
                     # f"| MemLen: {len(self.replay)}"
@@ -324,9 +347,9 @@ class SACAgent_BASE:
                     f"| α: {alpha_scalar:.3f}"
                     f"| Rshape: {self.env.rshape:.2f}"
                     f"| {self.emojis[self.history['terminal'][-1]]}: {self.history['terminal'][-1]}"
+                    F"| Qrange: [{min_q:.2f}, {max_q:.2f}]"
                     # f"| Mean Act: {np.round(self.history['action'][-1], 2)}"
                 )
-            # s 🛑   ⚠ ☤ ⛒ ⛌ ⛐ ⛍ ⛛
 
             ############### REPORTING ###############
             if ep % self.log_interval == 0:
@@ -374,10 +397,6 @@ class SACAgent_BASE:
                 # self.history["ep_reward"].clear()
                 self.history["xy"].clear()
 
-            # if ep % self.log_interval**2 == 0:
-            #     test_info = self.test(max_episodes=10)
-            #     self.logger._plot_history()
-
 
     def test(self,max_episodes=10):
         test_info = {
@@ -416,6 +435,10 @@ class SACAgent_BASE:
 
                 # Step
                 _, r_samples, done_samples, info = self.env.step(a1)
+                if self.normailize_reward:
+                    r_samples = self.env._normalize_reward(r_samples)
+
+
                 o2 = self.env.observation
                 o2_pt = torch.tensor(o2, dtype=torch.float32, device=self.device)
 
@@ -465,55 +488,41 @@ class SACAgent_BASE:
             d = d.expand(-1, r_vals.shape[1])
 
         # ---------------------- target ----------------------
-        # with torch.no_grad():
-        #     a2, logp2, _ = self.policy.sample(o2)                 # a2 [B,A], logp2 [B,1]
-        #     q1_t = self.q1_targ(o2, a2)
-        #     q2_t = self.q2_targ(o2, a2)
-        #     min_q_t = torch.min(q1_t, q2_t).squeeze(-1)          # [B]
-        #     ent_term = (self.alpha.detach() * logp2).squeeze(-1) # [B]
-        #     target_v = min_q_t - ent_term                        # [B]
-        #     td_targets = r_vals + (1.0 - d) * self.gamma * target_v.unsqueeze(1)  # [B,N]
-        #     assert torch.sum(r_probs, dim=1).allclose(torch.ones(r_probs.shape[0], device=self.device)), "Reward probs do not sum to 1!"
-        #     y = self._risk_measure(td_targets, r_probs)                            # [B]
         y = self._get_td_target_expectations(o1,a1, o2, r_vals, r_probs, d)  # [B]
+        assert torch.isfinite(y).all(), "Non-finite td-target values!"
 
         # ---------------------- critic update ----------------------
-        # q1 = self.q1(o1, a1).squeeze(-1)  # [B]
-        # q2 = self.q2(o1, a1).squeeze(-1)  # [B]
-        # loss_q = F.smooth_l1_loss(q1, y) + F.smooth_l1_loss(q2, y)
-        #
-        # if not torch.isfinite(loss_q):
-        #     raise FloatingPointError(f"Non-finite critic loss: {loss_q.item()}")
-
         if isinstance(self.q_opt, SPSA):
             # NOTE: Do NOT call backward() here.
 
             def closure():
                 q1 = self.q1(o1, a1).squeeze(-1)  # [B]
                 q2 = self.q2(o1, a1).squeeze(-1)  # [B]
-                loss = F.smooth_l1_loss(q1, y) + F.smooth_l1_loss(q2, y)
-                # Closure must return a scalar
-                # if not isinstance(loss, torch.Tensor) or loss.ndim != 0:
-                #     raise ValueError(
-                #         f"Closure must return a scalar Tensor, got {type(loss)} shape={getattr(loss, 'shape', None)}")
+                # assert torch.isfinite(q1).all(), "Non-finite Q1 values!"
+                # assert torch.isfinite(q2).all(), "Non-finite Q2 values!"
+                loss = self.q_loss_fn(q1, y) + self.q_loss_fn(q2, y)
                 return loss
 
-            for _ in range(20):
-                loss_q = self.q_opt.step(closure)
+            loss_q = self.q_opt.step(closure)
+            assert torch.isfinite(loss_q).all(), "Non-finite critic loss!"
+
+
         else:
 
             q1 = self.q1(o1, a1).squeeze(-1)  # [B]
             q2 = self.q2(o1, a1).squeeze(-1)  # [B]
+            assert torch.isfinite(q1).all(), "Non-finite Q1 values!"
+            assert torch.isfinite(q2).all(), "Non-finite Q2 values!"
             loss_q = F.smooth_l1_loss(q1, y) + F.smooth_l1_loss(q2, y)
 
-            if not torch.isfinite(loss_q):
-                raise FloatingPointError(f"Non-finite critic loss: {loss_q.item()}")
 
             self.q_opt.zero_grad(set_to_none=True)
             loss_q.backward()
             if self.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()),
-                                               max_norm = self.grad_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.q1.parameters()) + list(self.q2.parameters()),
+                                               max_norm = self.grad_clip
+                )
 
 
             self.q_opt.step()
@@ -523,6 +532,8 @@ class SACAgent_BASE:
         q1_new = self.q1(o1, a_new)
         q2_new = self.q2(o1, a_new)
         min_q_new = torch.min(q1_new, q2_new)
+        self.q_stats['max'].append(float(torch.max(min_q_new).detach().cpu().item()))
+        self.q_stats['min'].append(float(torch.min(min_q_new).detach().cpu().item()))
 
         # actor minimizes: E[ alpha*log_pi - Q ]
         loss_pi = (self.alpha.detach() * logp_new - min_q_new).mean()
@@ -540,22 +551,21 @@ class SACAgent_BASE:
         # ---------------------- temperature update ----------------------
         if self.automatic_entropy_tuning:
             # alpha_loss = -(self.log_alpha * (logp_new + self.target_entropy).detach()).mean() # [generated]
-            alpha_loss = (-self.log_alpha.exp() * (logp_new + self.target_entropy).detach()).mean()
-
-            # alpha_loss = (action_probs.detach() * (-self.log_alpha.exp() * (logp_new + self.target_entropy).detach())).mean()
-            # alpha_loss = (action_probs.detach() * (-log_alpha.exp() * (log_pi + target_entropy).detach())).mean()
+            # alpha_loss = (-self.log_alpha.exp() * (logp_new + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.log_alpha * (logp_new + self.target_entropy).detach()).mean()
             # https: // docs.cleanrl.dev / rl - algorithms / sac /  # implementation-details_1
-
             self.alpha_opt.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_opt.step()
+            self.log_alpha.clamp(np.log(self.alpha_range[0]), np.log(self.alpha_range[1]))
+
+
 
         # ---------------------- target networks ----------------------
         soft_update(self.q1_targ, self.q1, self.tau)
         soft_update(self.q2_targ, self.q2, self.tau)
 
         return float(loss_q.item()), float(loss_pi.item()), float(self.alpha.detach().cpu().item())
-
 
     def _get_td_target_expectations(self,o1,a1,o2,r_vals,r_probs,d):
         with torch.no_grad():
@@ -782,26 +792,36 @@ class SACAgent_AVE(SACAgent_BASE):
 class SACAgent_EUT(SACAgent_BASE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # self.fig_title = f"AVE-SAC Agent ({self.start_time_str})"
         self.logger.fig_title = f"EUT-SAC Agent ({self.start_time_str})"
+
     def _risk_measure(self, vals: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-        return torch.mean(vals*probs, dim=1)
+        assert torch.sum(probs, dim=1).allclose(torch.ones(probs.shape[0], device=self.device)), "Probs do not sum to 1!"
+        return torch.sum(vals*probs, dim=1)
 
 
 
 class SACAgent_CPT(SACAgent_BASE):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, cpt_params, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # self.fig_title = f"CPT-SAC Agent ({self.start_time_str})"
         self.logger.fig_title = f"CPT-SAC Agent ({self.start_time_str})"
 
-        # self.cpt = CumulativeProspectTheory(b='mean', lam=2.25, eta_p=0.88, eta_n=0.88, delta_p=1, delta_n=1, offset_ref=True)
-        self.cpt = CumulativeProspectTheory(b='mean', lam=2.25, eta_p=0.88, eta_n=0.88, delta_p=1, delta_n=1, offset_ref=False)
-        # self.cpt = CumulativeProspectTheory(b=0, lam=2.25, eta_p=0.88, eta_n=0.88, delta_p=1, delta_n=1, offset_ref=False)
+        self.cpt = CumulativeProspectTheory(**cpt_params)
         self.init_params[''] = str(self.cpt)
 
-        # self.q_opt = SPSA(list(self.q1.parameters()) + list(self.q2.parameters()), lr=float(self.init_params['q_lr']))
         # self.q_opt = SPSA(list(self.q1.parameters()) + list(self.q2.parameters()))
+        # warnings.warn("Using SPSA optimizer for CPT-SAC critic!")
+
+        # n_freeze = 0
+        # self.q_opt = SPSA(list(self.q1.parameters())[n_freeze*2:] +
+        #                   list(self.q2.parameters())[n_freeze*2:])
+
+
+        # self.q_opt = optim.RMSprop(list(self.q1.parameters()) + list(self.q2.parameters()),
+        #                            lr=float(self.init_params['q_lr']))
+
+        # self.q_opt = optim.RMSprop(list(self.q1.parameters())[n_freeze*2] +
+        #                            list(self.q2.parameters())[n_freeze*2])
 
     def _risk_measure(self, vals: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         return self.cpt.sample_expectation_batch(vals)
@@ -825,24 +845,21 @@ class SACAgent_CPT(SACAgent_BASE):
 
         return cpt_rew[0]
 
-class SACAgent_CPT_Ref(SACAgent_BASE):
-    def __init__(self, reference_fname, *args, **kwargs):
-        self.reference_fname = reference_fname
-        _load_dict = self._load_dict(reference_fname)
+class SACAgent_CPT_Ref(SACAgent_CPT):
+    def __init__(self, reference_fname, cpt_params, *args, **kwargs):
+        self.ref_level = 0.9 # percent of optimal reference policy
 
 
-        super().__init__(*args, **kwargs)
+        super().__init__(cpt_params, *args, **kwargs)
         # self.fig_title = f"CPT-SAC Agent ({self.start_time_str})"
         self.logger.fig_title = f"CPT-SAC-REF Agent ({self.start_time_str})"
 
-        # self.cpt = CumulativeProspectTheory(b='mean', lam=2.25, eta_p=0.8, eta_n=0.8, delta_p=1, delta_n=1, offset_ref=True)
-        # self.cpt = CumulativeProspectTheory(b='mean', lam=2.25, eta_p=0.8, eta_n=0.8, delta_p=1, delta_n=1, offset_ref=False)
-        self.cpt = CumulativeProspectTheory(b=0, lam=2.25, eta_p=0.88, eta_n=0.88, delta_p=1, delta_n=1, offset_ref=False)
-
+        self.reference_fname = reference_fname
+        _load_dict = self._load_dict(reference_fname)
         assert self.cpt.b == 0, "SACAgent_CPT_Ref requires zero reference point."
 
         self.init_params[''] = str(self.cpt)
-        self.init_params['Ref'] = f"{reference_fname}"
+        self.init_params['Ref'] = f"{reference_fname.split('/')[-1]} | {self.ref_level:.2f}"
 
         self.q1_ref = QNetwork(self.state_dim, self.action_dim,
                            hidden_dim=self.size_hidden_layers,
@@ -897,34 +914,14 @@ class SACAgent_CPT_Ref(SACAgent_BASE):
             td_targets = r_vals + (1.0 - d) * self.gamma * target_v.unsqueeze(1)  # [B,N]
 
             # Artificial reference value for b
-            td_targets = td_targets - q_ref_vals.unsqueeze(-1)  # [B,N]
+            td_targets = td_targets  # [B,N]
 
             assert torch.sum(r_probs, dim=1).allclose(
                 torch.ones(r_probs.shape[0], device=self.device)), "Reward probs do not sum to 1!"
 
-
-            y = self._risk_measure(td_targets, r_probs)  # [B]
+            _b =  q_ref_vals.unsqueeze(-1) * self.ref_level  # [B,1]
+            y = self._risk_measure(td_targets - _b, r_probs)  # [B]
         return y
 
-    def _risk_measure(self, vals: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-        return self.cpt.sample_expectation_batch(vals)
 
-    def _reward_eval(self, info: dict) -> float:
-        """
-        Helper to compute the reward used for logging / reporting.
-        Objective is different depending on which agent is being used
-        """
-        # use cpt expectation reward for reporting
-        r_samples = info["reward_samples"].reshape(1, -1)
-        assert r_samples.shape == (1,self.env.n_samples), f"Expected reward samples shape [1, N], got {r_samples.shape}"
-        cpt_rew = self.cpt.sample_expectation_batch(r_samples)
-        assert cpt_rew.shape == (1,), f"Expected CPT reward shape [1,], got {cpt_rew.shape}"
-
-        # # Sanity check numpy against pytorch ------------------------
-        # pt_r_samples = torch.tensor(r_samples, dtype=torch.float32, device=self.device)
-        # pt_cpt_reward =  self.cpt.sample_expectation_batch(pt_r_samples)[0]
-        # assert np.isclose(cpt_rew, pt_cpt_reward.detach().cpu().item()), f"CPT reward mismatch: numpy {cpt_rew} vs torch {pt_cpt_reward.detach().cpu().item()}"
-
-
-        return cpt_rew[0]
 

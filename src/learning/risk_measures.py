@@ -490,7 +490,9 @@ class CumulativeProspectTheory:
         # return p ** delta / ((p ** delta + (1 - p) ** delta) ** (1 / delta))
 
     def __repr__(self):
-        return f"CPT(b:{self.b}, λ:{self.lam}, η+:{self.eta_p}, η-:{self.eta_n}, δ+:{self.delta_p}, δ-:{self.delta_n})"
+        return f"CPT(b:{self.b}, λ:{self.lam:.2f}," \
+               f" η+:{self.eta_p}, η-:{self.eta_n}," \
+               f" δ+:{self.delta_p}, δ-:{self.delta_n})"
 
 
 class CumulativeProspectTheory_OLD:

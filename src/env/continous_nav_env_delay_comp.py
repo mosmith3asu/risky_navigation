@@ -12,8 +12,8 @@ import warnings
 
 from src.utils.visibility_graph import VisibilityGraph
 from src.env.layouts import read_layout_dict
-from env.mdp import Compiled_LidarFun, Belief_FetchRobotMDP_Compiled
-from utils.file_management import get_project_root
+from src.env.mdp import Compiled_LidarFun, Belief_FetchRobotMDP_Compiled
+from src.utils.file_management import get_project_root
 
 
 #################################################################################
@@ -45,9 +45,12 @@ REWARD_COLLIDE = -500
 REWARD_DIST2GOAL_EXP = 1.0
 REWARD_DIST2GOAL_PROG = True
 REWARD_DIST2GOAL = 0.1
-REWARD_STOPPING = 0.001
-REWARD_STEP =  -(REWARD_DIST2GOAL + REWARD_STOPPING)
+REWARD_STOPPING = 0.01
+REWARD_STEP =  -1.1*(REWARD_DIST2GOAL + REWARD_STOPPING)
 
+
+if not REWARD_DIST2GOAL_PROG:
+    warnings.warn("Using non-progressive distance to goal reward.")
 #################################################################################
 # MDP and State Classes #########################################################
 #################################################################################
@@ -952,6 +955,9 @@ class ContinousNavEnv(EnvBase):
                  **kwargs
                  ):
         super().__init__(max_steps, dt, **kwargs) # contains default vals that do not need to be changed
+        self.step_is_rshape = kwargs.pop('step_is_rshape', True)
+        if self.step_is_rshape:
+            warnings.warn("step_is_rshape is enabled. make sure this is intentional.")
 
         start_pos = np.array(start_pos, dtype=np.float32)
         start_velocity = np.array(start_velocity, dtype=np.float32)
@@ -1213,7 +1219,10 @@ class ContinousNavEnv(EnvBase):
 
         rewards += rew_dist2goal * self.rshape  # progress towards goal reward
         rewards += rew_stopping * self.rshape
-        rewards += self.reward_step #* self.rshape  # time cost
+        if self.step_is_rshape:
+            rewards += self.reward_step  * self.rshape  # time cost
+        else:
+            rewards += self.reward_step #* self.rshape  # time cost
         rewards += (np.array(info['reason']) == 'collision')      * self.reward_collide
         rewards += (np.array(info['reason']) == 'goal_reached')   * self.reward_goal
 
@@ -1221,6 +1230,25 @@ class ContinousNavEnv(EnvBase):
         # assert np.all(rewards <= self.reward_max_step), f"Rewards out of max bounds: {rewards[rewards >= self.reward_min_step]}"
         # assert np.all(rewards >= self.reward_min_step), f"Rewards out of min bounds: {rewards[rewards <= self.reward_min_step]}"
         return rewards, info
+
+    def _normalize_reward(self, reward, scale = 10):
+        """Normalize reward to [-scale, scale] range based on known min and max rewards per step.
+        MUST MAINTAIN SIGN (neg/pos) and proportional value
+
+        """
+        # eps = 1e-6
+        # rmin,rmax = self.reward_min_step, self.reward_max_step
+        rmin = np.sign(self.reward_min_step) * max(abs(self.reward_min_step), abs(self.reward_max_step))
+        rmax = np.sign(self.reward_max_step) * max(abs(self.reward_min_step), abs(self.reward_max_step))
+        reward = np.array(reward, dtype=np.float64)
+        reward = (2 * scale * (reward - rmin)) / (rmax - rmin)  # normalize to [0, 2*scale]
+
+        reward = reward - scale  # scale to [-1, 1]
+
+        eps = 1e-3
+        assert np.all(reward <= scale + eps), f"Normalized reward out of bounds: {reward[reward > scale]}"
+        assert np.all(reward >= -(scale + eps)), f"Normalized reward out of bounds: {reward[reward < -scale]}"
+        return reward.astype(np.float32)
 
     @property
     def robot_probs(self):

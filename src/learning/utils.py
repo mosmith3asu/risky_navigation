@@ -12,6 +12,7 @@ class Logger:
         self.env = env
         self.fig_title = fig_title
         self.fig, self.axes = None, None
+        self.fig_num = None
         self.fig_assets = {}
         self.start_time_str = start_time_str
         self.reset_params = reset_params
@@ -23,10 +24,12 @@ class Logger:
 
         # Create a figure
         self.fig = plt.figure(figsize=(12, 6), constrained_layout=True)
+        self.fig_num = self.fig.number
         self.fig.suptitle(
             '\n'.join(wrap(self.fig_title + self.start_time_str, max_title_chars))
             # self.fig_title + f' ({self.start_time_str})'
         )
+
 
         gs = gridspec.GridSpec(3, 2, width_ratios=[1, 2], height_ratios=[1, 1, 0.75], figure=self.fig)
 
@@ -346,14 +349,7 @@ class Logger:
         # plt.draw()
         # plt.pause(tpause)
 
-    # def checkpoint(self, ep):
-    #     """Draw horizontal line on axes at episode `ep` to mark a checkpoint and update this line when called again
-    #
-    #     Draw axes:
-    #         self.rew_ax
-    #         self.loss_ax
-    #         self.sched_ax
-    #      """
+
     def checkpoint(self, ep):
         """
         Mark a training checkpoint at episode `ep` by drawing a vertical line (x = ep)
@@ -400,12 +396,19 @@ class Logger:
             self.fig.canvas.draw_idle()
             self.fig.canvas.flush_events()
 
+    def is_closed(self):
+        """Returns True if the logger figure has been closed."""
+        if self.fig is None:
+            return False
+        else:
+            return not plt.fignum_exists(self.fig.number)
+
 
 ####################################################################
 ### LEARNING TOOLS #################################################
 ####################################################################
 class ReplayBuffer:
-    def __init__(self, obs_dim, act_dim, size=int(1e6), device='cpu'):
+    def __init__(self, obs_dim, act_dim, size=int(1e6), device='cpu', seed=None):
         self.device = device
         self.size = size
         self.ptr = 0
@@ -415,6 +418,8 @@ class ReplayBuffer:
         self.r = torch.zeros((size, 1),         dtype=torch.float32, device=device)
         self.s2 = torch.zeros((size, obs_dim),  dtype=torch.float32, device=device)
         self.d = torch.zeros((size, 1),         dtype=torch.float32, device=device)
+        if seed is not None:
+            torch.manual_seed(seed)
 
     def add(self, s, a, r, s2, d):
         n = s.shape[0] if s.ndim == 2 else 1
@@ -445,8 +450,8 @@ class ReplayBuffer:
         return self.s[idxs], self.a[idxs], self.r[idxs], self.s2[idxs], self.d[idxs]
 
 class ProspectReplayBuffer(ReplayBuffer):
-    def __init__(self, obs_dim, act_dim, n_samples, size=int(1e6), device='cpu'):
-        super().__init__(obs_dim, act_dim, size, device)
+    def __init__(self, obs_dim, act_dim, n_samples, size=int(1e6), device='cpu',seed=None):
+        super().__init__(obs_dim, act_dim, size, device, seed)
         prospect_dim = 2 # [reward, prob]
         self.r = torch.zeros((size, prospect_dim, n_samples), dtype=torch.float32, device=device)
         self.d = torch.zeros((size, 1, n_samples), dtype=torch.float32, device=device)
@@ -471,6 +476,33 @@ class ProspectReplayBuffer(ReplayBuffer):
         self.ptr = (self.ptr + n) % self.size
         if self.ptr == 0:
             self.full = True
+
+    def save(self, filepath):
+        """Saves the replay buffer to a file."""
+        data = {
+            's': self.s.cpu(),
+            'a': self.a.cpu(),
+            'r': self.r.cpu(),
+            's2': self.s2.cpu(),
+            'd': self.d.cpu(),
+            'ptr': self.ptr,
+            'full': self.full
+        }
+        torch.save(data, filepath)
+        print(f"Replay buffer saved to {filepath}")
+
+    def load(self, filepath):
+        """Loads the replay buffer from a file."""
+        data = torch.load(filepath, map_location=self.device)
+        self.s = data['s'].to(self.device)
+        self.a = data['a'].to(self.device)
+        self.r = data['r'].to(self.device)
+        self.s2 = data['s2'].to(self.device)
+        self.d = data['d'].to(self.device)
+        self.ptr = data['ptr']
+        self.full = data['full']
+        print(f"Replay buffer loaded from {filepath}")
+
 
 class Schedule:
     """
