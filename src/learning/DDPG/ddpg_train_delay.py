@@ -16,10 +16,6 @@ def main(layout, MAX_EPIS = 3_000):
         'b_max_lin_vel': (1.5, 0.5),
         'b_max_lin_acc': (0.5, 0.2),
         'b_max_rot_vel': (math.pi / 2.0, math.pi / 6.0)
-        # 'b_min_lin_vel': (0.0, 1e-6),
-        # 'b_max_lin_vel': (1.0, 1e-6),
-        # 'b_max_lin_acc': (0.5, 1e-6),
-        # 'b_max_rot_vel': (np.pi / 4, 1e-6)
     }
 
     env_config['dt'] = 0.1
@@ -41,7 +37,7 @@ def main(layout, MAX_EPIS = 3_000):
 
         'grad_clip': 0.75,
 
-        'update_interval': 2,
+        'update_interval': 1,
 
         # 'warmup_epis': 100,
         'warmup_epis': 1,
@@ -64,7 +60,7 @@ def main(layout, MAX_EPIS = 3_000):
     }
 
 
-    env_config['max_steps'] = 200
+    env_config['max_steps'] = 400
 
 
     env = ContinousNavEnv.from_layout(layout, **env_config)

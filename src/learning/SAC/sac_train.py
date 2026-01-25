@@ -4,6 +4,15 @@ import math
 import matplotlib.pyplot as plt
 
 def main(layout, MAX_EPIS = 3_000):
+    cpt_rational = {
+        "b": 0,
+        "lam": 1,
+        "eta_p": 1,
+        "eta_n": 1,
+        "delta_p": 1,
+        "delta_n": 1,
+        "offset_ref": False
+    }
 
 
 
@@ -28,28 +37,28 @@ def main(layout, MAX_EPIS = 3_000):
 
     # OG Config
     agent_config = {  }
+    # load_fname = r"\2026-01-24_01-54-19_SACAgent_AVE_spath"
+    # agent_config['loads'] =  r'D:\PycharmProjects\risky_navigation\src\learning\SAC\models' + load_fname
+    agent_config['grad_clip'] = 1.0
 
 
     env = ContinousNavEnv.from_layout(layout, **env_config)
 
 
     ############ AVE AGENT ##############
-    agent_config['grad_clip'] = 1.0
-    agent_config['note'] = 'reduced rshape'
-    agent_config['randstart_sched'] = (1.0, 0.75, 250)
-    agent_config['rshape_sched'] = (1.0, 1.0, 1000)
-    # # agent_config['normailize_reward'] = True
-    agent = SACAgent_AVE(env, **agent_config)
-    # agent = SACAgent_EUT(env, **agent_config)
-    # # agent.load(r'D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-15_02-38-46_SACAgent_AVE_spath')
-    # agent.load(r"D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-19_01-11-42_SACAgent_AVE_spath")
+    # agent_config['note'] = 'new rshape + norm'
+    # agent_config['randstart_sched'] = (1.0, 0.75, 250)
+    # agent_config['rshape_sched'] = (1.0, 1.0, 1000)
+    # agent = SACAgent_AVE(env, **agent_config)
 
     ############ CPT AGENT ##############
-    # agent_config['note'] = 'reduced rshape'
+    cpt_params = cpt_rational
+
+    # agent_config['note'] = 'new rshap + lame'
     #
     # agent_config['alpha_init'] = 0.05
     # agent_config['randstart_sched'] = (1.0,0.75,250)
-    # agent_config['rshape_sched'] = (1.0, 0, 1000)
+    # agent_config['rshape_sched'] = (1.0, 1.0, 1000)
     # # agent_config['warmup_steps'] = 5_000 # fill replay memory
     # # agent_config['warmup_steps'] = 10_000 # fill replay memory
     #
@@ -57,9 +66,13 @@ def main(layout, MAX_EPIS = 3_000):
     # # agent_config['policy_lr'] = 1e-4/2
     # # agent_config['q_lr'] = 5e-4/2
     # # agent_config['automatic_entropy_tuning'] = False
-    # # agent_config['grad_clip'] = 1.0
+    # agent_config['grad_clip'] = 1.0
+    # # agent_config['loads'] = r"D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-21_18-29-20_SACAgent_AVE_spath"
+    #
     # agent_config['loads'] = r"D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-21_18-29-20_SACAgent_AVE_spath"
-    # agent_config['normailize_reward'] = True
+    # agent_config['loads'] = r"D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-24_01-54-19_SACAgent_AVE_spath"
+    #
+    #
     #
     # cpt_params = {
     #     "b": 0,
@@ -93,11 +106,7 @@ def main(layout, MAX_EPIS = 3_000):
     # # #     "offset_ref": False
     # # # }
     # #
-    # agent = SACAgent_CPT(cpt_params, env, **agent_config)
-    # # # progress dist2goal
-    # # agent.load(r"D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-19_01-11-42_SACAgent_AVE_spath")
-    # # # # standard dist2goal
-    # # # agent.load(r'D:\PycharmProjects\risky_navigation\src\learning\SAC\models\2026-01-15_02-38-46_SACAgent_AVE_spath')
+    agent = SACAgent_CPT(cpt_params, env, **agent_config)
 
     ########### REFERENCE CPT AGENT ##############
     # cpt_params = {

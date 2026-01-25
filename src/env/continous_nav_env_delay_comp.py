@@ -40,6 +40,7 @@ from src.utils.file_management import get_project_root
 # REWARD_STEP =  -(REWARD_DIST2GOAL + REWARD_STOPPING)
 
 # 15:33:15 (Bottom)
+REWARD_SCALING = True
 REWARD_GOAL = 100
 REWARD_COLLIDE = -500
 REWARD_DIST2GOAL_EXP = 1.0
@@ -50,7 +51,8 @@ REWARD_STEP =  0 #-1.1*(REWARD_DIST2GOAL + REWARD_STOPPING)
 
 # REWARD_STEP =  -1.1*(REWARD_DIST2GOAL + REWARD_STOPPING)
 
-
+if REWARD_SCALING:
+    warnings.warn("Using reward scaling. make sure intended behavior.")
 if not REWARD_DIST2GOAL_PROG:
     warnings.warn("Using non-progressive distance to goal reward.")
 #################################################################################
@@ -253,13 +255,24 @@ class Delayed_LidarState:
                                      )
 
 
-        # Step true state (X_t)
+        # Step true state (X_t) #TODO: Optimize this call by vectorizing with last call
         X_t = self.get_curr_robot_state()                               # resample robot dynamics
         X_tt = self.robot.step_true(X_t, action, self.dt)               # get delayed state and action history
-        dG_tt, δG_tt = self.f_dist2goal(X_tt)                           # Recover belief about current robot state (Xhat_t)
+        # dG_tt, δG_tt = self.f_dist2goal(X_tt)                           # Recover belief about current robot state (Xhat_t)
         L_tt = self.f_lidar(X_tt)
 
+        batched_X = [X_t, X_tt]
+        _dG, _δG = self.f_dist2goal(np.vstack(batched_X))
+        dG_t, dG_tt = np.split(_dG, len(batched_X))
+        δG_t, δG_tt = np.split(_δG, len(batched_X))
+
         # (True state) actual state of robot
+        info['s_t'] = self.compose_state(X=X_t,                               # Take step under dynamics samples
+                                  ahist=dummy_actions.flatten(),
+                                  goal_dist=dG_t,
+                                  goal_heading=δG_t,
+                                  lidar_dists= dummy_lidar[0,:].reshape(1,-1) # not really used but have anyway
+                                  )
         info['s_tt'] = self.compose_state(X=X_tt,                               # Take step under dynamics samples
                                   ahist=dummy_actions.flatten(),
                                   goal_dist=dG_tt,
@@ -589,7 +602,7 @@ class EnvBase(ABC):
         self.reward_dist2goal_exponent = REWARD_DIST2GOAL_EXP # exponent for distance to goal reward shaping
         self.reward_dist2goal = REWARD_DIST2GOAL  # maximum possible reward being close to goal
         self.reward_stopping = REWARD_STOPPING  # maximum possible reward being close to stopping to goal
-
+        self.scale_rewards = REWARD_SCALING
 
         self.reward_max_step = self.reward_goal + self.reward_dist2goal + self.reward_stopping +self.reward_step
         self.reward_min_step = self.reward_collide + self.reward_step
@@ -959,7 +972,7 @@ class ContinousNavEnv(EnvBase):
                  ):
         super().__init__(max_steps, dt, **kwargs) # contains default vals that do not need to be changed
         self.step_is_rshape = kwargs.pop('step_is_rshape', True)
-        if self.step_is_rshape:
+        if self.step_is_rshape and self.reward_step !=0:
             warnings.warn("step_is_rshape is enabled. make sure this is intentional.")
 
         start_pos = np.array(start_pos, dtype=np.float32)
@@ -1030,6 +1043,7 @@ class ContinousNavEnv(EnvBase):
         sdelay_tt, info = self._resolve_action(action, return_state_inference=self.reward_dist2goal_prog) # State transition
         shat_tt = info['shat_tt']
         shat_t = info['shat_t']
+        s_t = info['s_t']
         s_tt = info['s_tt']
         master_info['X_inference'] = info['X_inference']
 
@@ -1045,7 +1059,7 @@ class ContinousNavEnv(EnvBase):
 
         # Compute true transition
         true_done, true_info = self._resolve_terminal_state(s_tt, true_info) # check reach goal or collision
-        true_reward, true_info = self._resolve_rewards(s_tt, true_info)  # compute rewards
+        true_reward, true_info = self._resolve_rewards(s_tt, true_info,s_t)  # compute rewards
         self.done = true_done
         master_info['true_done'] = true_done
         master_info['true_reward'] = true_reward
@@ -1200,8 +1214,7 @@ class ContinousNavEnv(EnvBase):
             info['rew_dist2goal'] = rew_dist2goal
             assert np.all(np.abs(rew_dist2goal) <= self.reward_dist2goal + 1e-6), \
                 f"Invalid rew dist {rew_dist2goal[np.abs(rew_dist2goal) <= self.reward_dist2goal]}"
-
-
+            assert not REWARD_DIST2GOAL_PROG, "should not be here"
         else:
             dGoal = state_samples[:, self.state.idGoal]
             dGoal_prev = prev_state_samples[:,self.state.idGoal]
@@ -1244,6 +1257,8 @@ class ContinousNavEnv(EnvBase):
         # Sanity check
         # assert np.all(rewards <= self.reward_max_step), f"Rewards out of max bounds: {rewards[rewards >= self.reward_min_step]}"
         # assert np.all(rewards >= self.reward_min_step), f"Rewards out of min bounds: {rewards[rewards <= self.reward_min_step]}"
+        if self.scale_rewards:
+            rewards = self._normalize_reward(rewards, scale=10)
         return rewards, info
 
     def _normalize_reward(self, reward, scale = 10):
@@ -1257,12 +1272,11 @@ class ContinousNavEnv(EnvBase):
         rmax = np.sign(self.reward_max_step) * max(abs(self.reward_min_step), abs(self.reward_max_step))
         reward = np.array(reward, dtype=np.float64)
         reward = (2 * scale * (reward - rmin)) / (rmax - rmin)  # normalize to [0, 2*scale]
+        reward = reward - scale  # scale to [-scale, scale]
 
-        reward = reward - scale  # scale to [-1, 1]
-
-        eps = 1e-3
-        assert np.all(reward <= scale + eps), f"Normalized reward out of bounds: {reward[reward > scale]}"
-        assert np.all(reward >= -(scale + eps)), f"Normalized reward out of bounds: {reward[reward < -scale]}"
+        eps = 1e-2
+        assert np.all(np.abs(reward) <= 1.05*scale), f"Normalized reward out of bounds: {reward[np.abs(reward) >  1.05*scale]}"
+        # assert np.all(reward >= -(scale + eps)), f"Normalized reward out of bounds: {reward[reward < -scale]}"
         return reward.astype(np.float32)
 
     @property

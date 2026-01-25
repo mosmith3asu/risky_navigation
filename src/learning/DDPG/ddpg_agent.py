@@ -272,7 +272,8 @@ class DDPGAgent:
             done = False
             max_ep_len = self.env.get_attr('max_steps')[0]
 
-            while not done:
+            # Rollout -----------------------------------------------
+            for i in range(self.env.max_steps):
                 total_steps += 1
                 ep_len += 1
 
@@ -692,7 +693,8 @@ class DDPGAgent_EUT(DDPGAgent):
         del self.history
 
         self._tstart = time.time()
-        self.cpt = CumulativeProspectTheory(b=0.0, lam=1, eta_p=1, eta_n=1, delta_p=1, delta_n=1)
+        # self.cpt = CumulativeProspectTheory(b=0.0, lam=1, eta_p=1, eta_n=1, delta_p=1, delta_n=1)
+        self.cpt = CumulativeProspectTheory(b='mean', lam=2.25, eta_p=0.88, eta_n=0.88, delta_p=1, delta_n=1, offset_ref=True)
 
         self.fig_title = kwargs.pop('fig_title', f'DDPG-EUT Agent ({self.start_time_str})')
         self.delay_steps = self.env.delay_steps
@@ -963,6 +965,7 @@ class DDPGAgent_EUT(DDPGAgent):
 
     def risk_measure(self,vals,probs):
         """Computes rational expectation from vals and pdf (probs)."""
+        # return torch.sum(vals, dim=1)
         return self.cpt.sample_expectation_batch(vals)
         # return pdf_expectation_torch_batch(vals, probs)
         # expectations= quantile_expectation(vals)
@@ -999,7 +1002,9 @@ class DDPGAgent_EUT(DDPGAgent):
             # Critic ##############################################################
             q = self.critic(o1, a1).squeeze()
 
-            critic_loss = F.mse_loss(q, td_expectation)
+            # critic_loss = F.mse_loss(q, td_expectation)
+            critic_loss = F.smooth_l1_loss(q, td_expectation)
+
             assert np.isfinite(critic_loss.item()), f'Non-finite critic loss: {critic_loss.item()}'
 
             self.optimC.zero_grad()

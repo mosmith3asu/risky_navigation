@@ -58,7 +58,7 @@ class SACAgent_BASE:
         updates_per_step: int = 1,
         num_hidden_layers: int = 5,
         size_hidden_layers: int = 256,
-            normailize_reward = False,
+            # normailize_reward = False,
         loads: Optional[str] = None,
         note: str = '',
     ):
@@ -68,6 +68,7 @@ class SACAgent_BASE:
         self.init_params = self._parse_params(locals())
         self.init_params['R'] = f'[G:{self.env.reward_goal}  C:{self.env.reward_collide} dt:{self.env.reward_step}]'
         self.init_params['Rs'] = f'[dist:{self.env.reward_dist2goal}-prog {self.env.reward_dist2goal_prog}  stop:{self.env.reward_stopping} ]'
+        self.init_params['Sclae R'] = f'{self.env.scale_rewards}'
         self.init_params['Term'] = f'[T: {self.env.time_is_terminal} G: {self.env.goal_is_terminal} ]'
         self.gamma = gamma
         self.tau = tau
@@ -78,9 +79,6 @@ class SACAgent_BASE:
         self.size_hidden_layers = size_hidden_layers
         self.grad_clip = grad_clip
         self._last_terminal_scale = 1 # accounts for cumulated rewards not terminating in sampled states
-        self.normailize_reward = normailize_reward
-        if self.normailize_reward:
-            warnings.warn("Reward normalization is enabled for SACAgent_BASE. Make sure this is intended.")
 
         # dims & bounds
         self.state_dim = env.observation_space.shape[0]
@@ -215,8 +213,6 @@ class SACAgent_BASE:
             o1 = self.env.observation
             a_np = np.random.uniform(low=self.env.action_space.low, high=self.env.action_space.high, size=self.action_dim)
             _, r_samples, done_samples, info = self.env.step(a_np)
-            if self.normailize_reward:
-                r_samples = self.env._normalize_reward(r_samples)
 
             o2 = self.env.observation
 
@@ -282,8 +278,6 @@ class SACAgent_BASE:
 
                 # Step
                 _, r_samples, done_samples, info = self.env.step(a1)
-                if self.normailize_reward:
-                    r_samples = self.env._normalize_reward(r_samples)
 
                 o2 = self.env.observation
                 o2_pt = torch.tensor(o2, dtype=torch.float32, device=self.device)
@@ -435,8 +429,6 @@ class SACAgent_BASE:
 
                 # Step
                 _, r_samples, done_samples, info = self.env.step(a1)
-                if self.normailize_reward:
-                    r_samples = self.env._normalize_reward(r_samples)
 
 
                 o2 = self.env.observation
